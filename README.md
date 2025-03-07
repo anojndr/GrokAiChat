@@ -1,168 +1,156 @@
-# GrokAiChat
+# GrokAI OpenAI-Compatible API
 
-A Python library for interacting with Grok AI through X's user account API. This project provides a clean interface for creating conversations, sending messages, and handling responses. Note: This uses the account user API, not the paid enterprise API. Grok AI is free for all X (Twitter) members.
+This project extends the GrokAiChat library to provide an OpenAI-compatible API, allowing you to use Grok AI with applications that support the OpenAI API format.
 
 ## Features
 
-- 🤖 Full Grok API integration
-- 📁 File upload support
-- 💬 Conversation management
-- 🛠️ Easy-to-use interface
+- 🔄 Full OpenAI API compatibility
+- 🤖 Uses Grok AI for responses
+- 📦 Support for multiple Grok models
+- 💬 True real-time streaming responses
+- 🛠️ Compatible with OpenAI SDKs
 
 ## Prerequisites
 
 - Python 3.8 or higher
 - A valid X (formerly Twitter) account
-- Grok AI access (free for all X members)
-- Your account's authentication tokens
+- Grok AI access
+- Your account's authentication tokens (same as original GrokAiChat)
 
 ## Installation
 
 1. Clone the repository:
-    ```sh
-    git clone https://github.com/vibheksoni/GrokAiChat.git
-    cd GrokAiChat
-    ```
+   ```sh
+   git clone https://github.com/yourusername/grokai-openai-api.git
+   cd grokai-openai-api
+   ```
 
 2. Install dependencies:
-    ```sh
-    pip install -r requirements.txt
-    ```
+   ```sh
+   pip install -r requirements.txt
+   ```
 
 ## Configuration
 
-1. Create a `.env` file in the project root:
-    ```dotenv
-    # Raw cookies string
-    # Example: "cookie1=value1; cookie2=value2"
-    COOKIES=""
-    # CSRF token
-    # Create a chat and send a message look at the headers of the request and check for the CSRF token
-    X_CSRF_TOKEN=""
-    # Bearer token
-    # Create a chat and send a message look at the headers of the request and check for the Bearer token
-    BEARER_TOKEN=""
-    ```
+Create a `.env` file in the project root:
 
-2. To obtain your tokens:
-    - Log into X.com
-    - Open Developer Tools (F12)
-    - Create a Grok chat
-    - Find the tokens in the Network tab request headers
+```env
+# Original GrokAI credentials
+COOKIES="your_cookies_here"
+X_CSRF_TOKEN="your_csrf_token_here"
+BEARER_TOKEN="your_bearer_token_here"
 
-## Account Requirements & Credentials
-
-⚠️ **IMPORTANT**: You need:
-1. A standard X account (Grok AI is free for all X members)
-2. The following credentials from your account:
-
-### How to Get Your Credentials
-
-1. **Cookies**:
-   - Log into X.com
-   - Open Developer Tools (F12) → Network tab
-   - Interact with Grok
-   - Find any request to x.com
-   - Copy the entire `cookie` header value
-
-2. **X-CSRF-Token**:
-   - In the same Network tab
-   - Look for `x-csrf-token` in request headers
-   - It's usually a 32-character string
-
-3. **Bearer Token**:
-   - Find any request header containing `authorization`
-   - Copy the token after "Bearer "
-   - Usually starts with "AAAA..."
-
-Store these in your `.env` file:
-```dotenv
-COOKIES="your_copied_cookie_string"
-X_CSRF_TOKEN="your_csrf_token"
-BEARER_TOKEN="your_bearer_token"
+# Server settings
+PORT=5000
 ```
 
-## ⚠️ Important Legal Warnings
+To obtain credentials, follow the instructions in the original GrokAiChat README.
 
-1. **Terms of Service**: This project **may violate** X's Terms of Service. Use at your own risk.
-2. **Account Security**: 
-   - Never share your credentials
-   - Avoid excessive requests
-   - Use reasonable rate limits
-3. **Compliance**:
-   - This tool is for educational purposes only
-   - Commercial use may violate X's terms
-   - You are responsible for how you use this code
+## Usage
 
-## Rate Limiting
+### Starting the Server
 
-To avoid account flags:
-- Limit requests to reasonable human speeds
-- Add delays between messages
-- Don't automate mass messaging
+```sh
+python app.py
+```
 
-## Quick Start
+The server will start at `http://localhost:5000` (or your configured PORT).
+
+### API Endpoints
+
+#### List Models
+```
+GET /v1/models
+```
+
+#### Chat Completions
+```
+POST /v1/chat/completions
+```
+
+Request body:
+```json
+{
+  "model": "grok-3",
+  "messages": [
+    {"role": "user", "content": "Hello, Grok!"}
+  ],
+  "stream": false
+}
+```
+
+### Using with OpenAI-compatible clients
+
+#### Python OpenAI Client
 
 ```python
-from grok import Grok, GrokMessages
-from dotenv import load_dotenv
-import os
+from openai import OpenAI
 
-load_dotenv()
-grok = Grok(
-    os.getenv("BEARER_TOKEN"),
-    os.getenv("X_CSRF_TOKEN"),
-    os.getenv("COOKIES")
+client = OpenAI(
+    api_key="any-key",  # Not used but required
+    base_url="http://localhost:5000/v1"  # Your local server URL
 )
 
-# Create a conversation
-grok.create_conversation()
+response = client.chat.completions.create(
+    model="grok-3",
+    messages=[
+        {"role": "user", "content": "Hello, how are you?"}
+    ]
+)
 
-# Send a message
-request = grok.create_message("grok-2")
-grok.add_user_message(request, "Hello, Grok!")
-response = grok.send(request)
-
-# Parse and print response
-messages = GrokMessages(response)
-print(messages.get_full_message())
+print(response.choices[0].message.content)
 ```
 
-## Advanced Usage
+#### Streaming Example
 
-Check the `examples/` directory for more advanced use cases:
-- Basic chat interaction (`chat.py`)
-- File attachments (`chatwithfiles.py`)
-- Custom model parameters
-- Response parsing
+```python
+from openai import OpenAI
 
-## API Documentation
+client = OpenAI(
+    api_key="any-key",
+    base_url="http://localhost:5000/v1"
+)
 
-### Main Classes
+stream = client.chat.completions.create(
+    model="grok-3",
+    messages=[
+        {"role": "user", "content": "Write me a short story about AI"}
+    ],
+    stream=True
+)
 
-- `Grok`: Main interface for API interactions
-- `GrokMessages`: Response parser and message handler
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+```
 
-Full documentation is available in the code comments.
+## Model Mapping
 
-## Contributing
+This API maps OpenAI model names to Grok models:
 
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
+- `gpt-3.5-turbo` → `grok-1`
+- `gpt-4` → `grok-2`
+- `gpt-4-turbo` → `grok-3`
+- `gpt-4-vision` → `grok-3`
 
-## Legal Notice
+You can also use Grok model names directly: `grok-1`, `grok-2`, `grok-3`
 
-⚠️ **Disclaimer**: This project is for educational purposes only. Users are responsible for ensuring their usage complies with X's terms of service.
+## Features
+
+### Real-time Streaming
+
+The API now supports true real-time streaming of responses from Grok. When using `stream=True`, responses are sent token-by-token as they are received from Grok's API, rather than waiting for the complete response first.
+
+### Multi-turn Conversations
+
+The API simulates multi-turn conversations by including context from previous messages in each new request to Grok.
+
+## Limitations
+
+- The API currently doesn't support all OpenAI parameters
+- Token counting is approximate
+- Multi-turn conversations are simulated by including context in the message
 
 ## License
 
-[MIT License](LICENSE) - See license file for details.
-
-## Author
-
-**Vibhek Soni**
-- Age: 19
-- GitHub: [@vibheksoni](https://github.com/vibheksoni)
-- Project Link: [GrokAiChat](https://github.com/vibheksoni/GrokAiChat)
-
+MIT License, following the original GrokAiChat license.

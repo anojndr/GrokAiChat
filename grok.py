@@ -275,3 +275,22 @@ class Grok:
         """
         response = self.session.post(ADD_RESPONSE_URL, json=request_data)
         return response.text
+    
+    def send_streaming(self, request_data: dict):
+        """
+        Send the conversation payload to the server and yield message tokens as they arrive.
+        This allows for real-time streaming of Grok's responses.
+        """
+        with self.session.post(ADD_RESPONSE_URL, json=request_data, stream=True) as response:
+            for line in response.iter_lines():
+                if line:
+                    line_text = line.decode('utf-8')
+                    try:
+                        parsed = json.loads(line_text)
+                        result_data = parsed.get("result", {})
+                        message_token = result_data.get("message")
+                        if message_token:
+                            yield message_token
+                    except json.JSONDecodeError:
+                        # Skip malformed JSON
+                        continue
