@@ -82,8 +82,8 @@ def rotate_credentials():
 def is_rate_limited(response_text):
     """Check if the response indicates a rate limit."""
     try:
-        # Check for the rate limit signature in the response
-        if '"responseType":"limiter"' in response_text:
+        # Check for the specific rate limit error message
+        if "You've reached your limit of 15 Grok questions per 2 hours for now" in response_text:
             return True
         
         # Try parsing the response as JSON
@@ -91,7 +91,10 @@ def is_rate_limited(response_text):
             if line.strip():
                 parsed = json.loads(line)
                 result = parsed.get("result", {})
-                if result.get("responseType") == "limiter":
+                
+                # Check for rate limit message in parsed message content
+                message = result.get("message", "")
+                if "You've reached your limit of 15 Grok questions per 2 hours for now" in message:
                     return True
     except (json.JSONDecodeError, KeyError):
         pass
@@ -263,7 +266,7 @@ def chat_completions():
                         
                         for message_token in grok_message_stream:
                             # Check if this chunk contains a rate limit message
-                            if '"responseType":"limiter"' in message_token:
+                            if "You've reached your limit of 15 Grok questions per 2 hours for now" in message_token:
                                 rate_limited = True
                                 break
                             
