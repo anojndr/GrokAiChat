@@ -10,6 +10,11 @@ CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation
 ADD_RESPONSE_URL = "https://api.x.com/2/grok/add_response.json"
 UPLOAD_FILE_URL = "https://x.com/i/api/2/grok/attachment.json"
 
+# Default timeout settings (in seconds)
+DEFAULT_CONNECT_TIMEOUT = 10.0  # Connection timeout
+DEFAULT_READ_TIMEOUT = 30.0     # Read timeout
+DEFAULT_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)  # (connect, read) tuple
+
 class GrokMessages:
     """
     Represents a collection of conversation results parsed from raw JSON lines.
@@ -60,21 +65,36 @@ class GrokMessages:
         lines = self.raw_data.splitlines()
         for line in lines:
             if line.strip():
-                parsed = json.loads(line)
-                result_data = parsed.get("result", {})
-                result = self.Result(
-                    sender=result_data.get("sender"),
-                    message=result_data.get("message"),
-                    query=result_data.get("query"),
-                    feedback_labels=result_data.get("feedbackLabels"),
-                    follow_up_suggestions=result_data.get("followUpSuggestions"),
-                    tools_used=result_data.get("toolsUsed"),
-                    cited_web_results=result_data.get("citedWebResults"),
-                    web_results=result_data.get("webResults"),
-                    media_post_ids=result_data.get("xMediaPostIds"),
-                    post_ids=result_data.get("xPostIds"),
-                )
-                self.results.append(result)
+                try:
+                    parsed = json.loads(line)
+                    result_data = parsed.get("result", {})
+                    
+                    # Skip entries with messageTag set to "thinking_trace"
+                    if result_data.get("messageTag") == "thinking_trace":
+                        continue
+                        
+                    # Additional check for thinking traces
+                    if result_data.get("isThinking") == True:
+                        continue
+                    
+                    result = self.Result(
+                        sender=result_data.get("sender"),
+                        message=result_data.get("message"),
+                        query=result_data.get("query"),
+                        feedback_labels=result_data.get("feedbackLabels"),
+                        follow_up_suggestions=result_data.get("followUpSuggestions"),
+                        tools_used=result_data.get("toolsUsed"),
+                        cited_web_results=result_data.get("citedWebResults"),
+                        web_results=result_data.get("webResults"),
+                        media_post_ids=result_data.get("xMediaPostIds"),
+                        post_ids=result_data.get("xPostIds"),
+                    )
+                    self.results.append(result)
+                except json.JSONDecodeError:
+                    # Skip malformed JSON
+                    continue
+                except Exception as e:
+                    print(f"Error parsing result: {str(e)}")
 
     def get_message_tokens(self) -> List[str]:
         """
@@ -144,13 +164,22 @@ class Grok:
         self,
         account_bearer_token: str,
         x_csrf_token: str,
-        cookies: str
+        cookies: str,
+        timeout: tuple = DEFAULT_TIMEOUT
     ) -> None:
         """
         Initialize a requests session and store relevant headers.
+        
+        Args:
+            account_bearer_token: Bearer token for authentication
+            x_csrf_token: CSRF token for protection against CSRF attacks
+            cookies: Cookies string for authentication
+            timeout: Request timeout as tuple (connect_timeout, read_timeout) in seconds
         """
         self.session = requests.Session()
         self.client_uuid = uuid.uuid4().hex
+        self.timeout = timeout
+        
         headers = {
             "accept": "*/*",
             "accept-encoding": "gzip, deflate",
@@ -189,9 +218,20 @@ class Grok:
         """
         query_id = "6cmfJY3d7EPWuCSXWrkOFg"
         data = {"variables":{},"queryId":query_id}
-        response = self.session.post(CREATE_CONVERSATION_URL.format(query_id), json=data)
-        self.conversation_info = response.json()
-        print(self.conversation_info)
+        try:
+            response = self.session.post(
+                CREATE_CONVERSATION_URL.format(query_id), 
+                json=data, 
+                timeout=self.timeout
+            )
+            self.conversation_info = response.json()
+            print(f"Created conversation: {self.conversation_info.get('data', {}).get('create_grok_conversation', {}).get('conversation_id', 'unknown')}")
+        except requests.exceptions.Timeout:
+            print("Timeout error when creating conversation. Check your network connection or X.com API availability.")
+            raise
+        except requests.exceptions.RequestException as e:
+            print(f"Error creating conversation: {str(e)}")
+            raise
     
     def upload_file(self, file_path: str) -> dict:
         """
@@ -216,12 +256,28 @@ class Grok:
                 }
             except Exception as e:
                 raise Exception(f"Error preparing file upload: {str(e)}")
-            response = self.session.post(UPLOAD_FILE_URL, files=files)
-            response_json = response.json()
-            media_id = response_json[0]["mediaId"]
-            response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
-            self.session.headers["content-type"] = original_content_type
-            return response_json
+            
+            try:
+                response = self.session.post(
+                    UPLOAD_FILE_URL, 
+                    files=files, 
+                    timeout=self.timeout
+                )
+                response_json = response.json()
+                media_id = response_json[0]["mediaId"]
+                response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
+                self.session.headers["content-type"] = original_content_type
+                return response_json
+            except requests.exceptions.Timeout:
+                print("Timeout error when uploading file. Check your network connection or X.com API availability.")
+                raise
+            except requests.exceptions.RequestException as e:
+                print(f"Error uploading file: {str(e)}")
+                raise
+            finally:
+                # Ensure we restore the content-type header
+                if original_content_type:
+                    self.session.headers["content-type"] = original_content_type
     
     def create_message(
         self, 
@@ -230,7 +286,9 @@ class Grok:
         returnSearchResults: bool = True,
         returnCitations: bool = True,
         eagerTweets: bool = True,
-        serverHistory: bool = True
+        serverHistory: bool = True,
+        isDeepsearch: bool = False,
+        isReasoning: bool = False
     ) -> dict:
         """
         Create a template for the conversation payload using the specified Grok model.
@@ -250,7 +308,11 @@ class Grok:
             "requestFeatures": {
                 "eagerTweets": eagerTweets,
                 "serverHistory": serverHistory
-            }
+            },
+            "enableSideBySide": True,
+            "toolOverrides": {},
+            "isDeepsearch": isDeepsearch,
+            "isReasoning": isReasoning
         }
 
     def add_user_message(
@@ -266,6 +328,7 @@ class Grok:
         request_data["responses"].append({
             "message": message,
             "sender": sender,
+            "promptSource": "",
             "fileAttachments": file_attachments
         })
     
@@ -273,24 +336,93 @@ class Grok:
         """
         Send the conversation payload to the server and return the response text.
         """
-        response = self.session.post(ADD_RESPONSE_URL, json=request_data)
-        return response.text
+        try:
+            response = self.session.post(
+                ADD_RESPONSE_URL, 
+                json=request_data, 
+                timeout=self.timeout
+            )
+            return response.text
+        except requests.exceptions.Timeout:
+            print("Timeout error when sending message. Check your network connection or X.com API availability.")
+            raise
+        except requests.exceptions.RequestException as e:
+            print(f"Error sending message: {str(e)}")
+            raise
     
-    def send_streaming(self, request_data: dict):
+    def _is_rate_limit_response(self, result_data):
+        """Check if the result_data indicates a rate limit."""
+        # Check for explicit rate limit indicators
+        if result_data.get("responseType") == "limiter":
+            return True
+        
+        # Check for upsell object which indicates premium requirement
+        if "upsell" in result_data:
+            return True
+        
+        # Check message content for rate limit text
+        message = result_data.get("message", "")
+        if message and ("You've reached your limit" in message or "limit of" in message):
+            return True
+        
+        return False
+    
+    def send_streaming(self, request_data: dict, filter_final_only=False):
         """
         Send the conversation payload to the server and yield message tokens as they arrive.
         This allows for real-time streaming of Grok's responses.
+        
+        Args:
+            request_data: The request payload to send
+            filter_final_only: If True, only yield messages with messageTag="final"
         """
-        with self.session.post(ADD_RESPONSE_URL, json=request_data, stream=True) as response:
-            for line in response.iter_lines():
-                if line:
-                    line_text = line.decode('utf-8')
-                    try:
-                        parsed = json.loads(line_text)
-                        result_data = parsed.get("result", {})
-                        message_token = result_data.get("message")
-                        if message_token:
-                            yield message_token
-                    except json.JSONDecodeError:
-                        # Skip malformed JSON
-                        continue
+        try:
+            with self.session.post(
+                ADD_RESPONSE_URL, 
+                json=request_data, 
+                stream=True, 
+                timeout=self.timeout
+            ) as response:
+                for line in response.iter_lines():
+                    if line:
+                        line_text = line.decode('utf-8')
+                        try:
+                            parsed = json.loads(line_text)
+                            result_data = parsed.get("result", {})
+                            
+                            # Check if this is a rate limit response BEFORE filtering
+                            if self._is_rate_limit_response(result_data):
+                                # Yield a special token to indicate rate limiting
+                                yield "__RATE_LIMITED__"
+                                return
+                            
+                            message_token = result_data.get("message")
+                            message_tag = result_data.get("messageTag")
+                            
+                            # Skip entries with messageTag set to "thinking_trace"
+                            if message_tag == "thinking_trace":
+                                continue
+                                
+                            # Check if this is potentially a thinking trace (additional check)
+                            if result_data.get("isThinking") == True:
+                                continue
+                            
+                            # Check if we should filter for final messages
+                            if message_token:
+                                # For deepsearch responses, only include chunks tagged as "final"
+                                if filter_final_only:
+                                    if message_tag == "final":
+                                        yield message_token
+                                else:
+                                    yield message_token
+                        except json.JSONDecodeError:
+                            # Skip malformed JSON
+                            continue
+                        except Exception as e:
+                            print(f"Error processing streaming response: {str(e)}")
+        except requests.exceptions.Timeout:
+            print("Timeout error during streaming. Check your network connection or X.com API availability.")
+            yield "__TIMEOUT__"
+        except requests.exceptions.RequestException as e:
+            print(f"Error during streaming: {str(e)}")
+            yield f"__ERROR__: {str(e)}"
