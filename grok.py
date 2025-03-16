@@ -4,6 +4,8 @@ Age: 19
 Github: https://github.com/vibheksoni
 """
 import requests, uuid, json, mimetypes
+import base64
+import secrets
 from typing import List, Optional
 
 CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation"
@@ -160,6 +162,29 @@ class Grok:
     """
     Provides methods to manage Grok interactions such as creating conversations, uploading files, and sending messages.
     """
+    def generate_random_base64_string(self, length=94):
+        """
+        Generate a random Base64 string of specified length.
+        
+        Args:
+            length: The desired length of the output string
+            
+        Returns:
+            A random Base64 string of the specified length
+        """
+        # Calculate how many random bytes we need
+        # Base64 encodes 3 bytes into 4 characters
+        byte_length = (length * 3) // 4 + 1
+        
+        # Generate random bytes using cryptographically secure random generator
+        random_bytes = secrets.token_bytes(byte_length)
+        
+        # Encode the bytes as Base64
+        base64_string = base64.b64encode(random_bytes).decode('utf-8')
+        
+        # Trim to the desired length and return
+        return base64_string[:length]
+        
     def __init__(
         self,
         account_bearer_token: str,
@@ -180,9 +205,12 @@ class Grok:
         self.client_uuid = uuid.uuid4().hex
         self.timeout = timeout
         
+        # Generate transaction ID
+        transaction_id = self.generate_random_base64_string(94)
+        
         headers = {
             "accept": "*/*",
-            "accept-encoding": "gzip, deflate",
+            "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {account_bearer_token}",
             "content-type": "application/json",
@@ -190,13 +218,14 @@ class Grok:
             "origin": "https://x.com",
             "priority": "u=1, i",
             "referer": "https://x.com/i/grok",
-            "sec-ch-ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+            "sec-ch-ua": "\"Chromium\";v=\"134\", \"Not:A-Brand\";v=\"24\", \"Google Chrome\";v=\"134\"",
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": "\"Windows\"",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            "x-client-transaction-id": transaction_id,
             "x-client-uuid": self.client_uuid,
             "x-csrf-token": x_csrf_token,
             "x-twitter-active-user": "yes",
@@ -216,9 +245,27 @@ class Grok:
         """
         Create a new Grok conversation and store the conversation info.
         """
-        query_id = "6cmfJY3d7EPWuCSXWrkOFg"
+        query_id = "vvC5uy7pWWHXS2aDi1FZeA"
         data = {"variables":{},"queryId":query_id}
+        
+        # Create a copy of the headers to sanitize
+        sanitized_headers = {}
+        for key, value in self.session.headers.items():
+            if isinstance(value, str):
+                # Replace any problematic Unicode characters with ASCII equivalents
+                # \u2026 (ellipsis) is replaced with "..."
+                sanitized_value = value.replace("\u2026", "...").encode('ascii', 'ignore').decode('ascii')
+                sanitized_headers[key] = sanitized_value
+            else:
+                sanitized_headers[key] = value
+        
+        # Save original headers
+        original_headers = self.session.headers.copy()
+        
         try:
+            # Use sanitized headers for this request
+            self.session.headers = sanitized_headers
+            
             response = self.session.post(
                 CREATE_CONVERSATION_URL.format(query_id), 
                 json=data, 
@@ -228,10 +275,17 @@ class Grok:
             print(f"Created conversation: {self.conversation_info.get('data', {}).get('create_grok_conversation', {}).get('conversation_id', 'unknown')}")
         except requests.exceptions.Timeout:
             print("Timeout error when creating conversation. Check your network connection or X.com API availability.")
+            # Restore original headers before raising exception
+            self.session.headers = original_headers
             raise
         except requests.exceptions.RequestException as e:
             print(f"Error creating conversation: {str(e)}")
+            # Restore original headers before raising exception
+            self.session.headers = original_headers
             raise
+        
+        # Restore original headers after successful request
+        self.session.headers = original_headers
     
     def upload_file(self, file_path: str) -> dict:
         """

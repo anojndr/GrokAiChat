@@ -292,7 +292,10 @@ def prepare_messages(messages, grok_client):
                 image_url = item['image_url']['url']
                 uploaded_file = download_and_upload_image(grok_client, image_url)
                 if uploaded_file:
-                    file_attachments = uploaded_file  # Set to the response from upload_file
+                    if isinstance(uploaded_file, list):
+                        file_attachments.extend(uploaded_file)  # Extend with the list of uploaded files
+                    else:
+                        file_attachments.append(uploaded_file)  # Append a single uploaded file
         last_message_content = " ".join(text_parts)
     else:
         last_message_content = last_message['content']
