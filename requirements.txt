@@ -1,5 +1,6 @@
-flask
-flask-cors
-requests
-python-dotenv
-sseclient
+fastapi>=0.103.1
+uvicorn[standard]>=0.23.2
+pydantic>=2.3.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+sseclient>=0.0.27

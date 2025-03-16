@@ -5,15 +5,68 @@ import uuid
 import re
 import tempfile
 import requests
+from typing import List, Dict, Any, Optional, Union
 from urllib.parse import urlparse
-from flask import Flask, request, Response, jsonify, stream_with_context
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # Import the Grok modules
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from grok import Grok, GrokMessages
+
+# Pydantic models for request/response validation
+class MessageContent(BaseModel):
+    type: str
+    text: Optional[str] = None
+    image_url: Optional[Dict[str, str]] = None
+
+class Message(BaseModel):
+    role: str
+    content: Union[str, List[MessageContent]]
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Message]
+    stream: bool = False
+
+class Delta(BaseModel):
+    content: Optional[str] = None
+
+class Choice(BaseModel):
+    index: int
+    delta: Optional[Delta] = None
+    message: Optional[Dict[str, Any]] = None
+    finish_reason: Optional[str] = None
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: List[Choice]
+    usage: Usage
+
+class ModelObject(BaseModel):
+    id: str
+    object: str
+    created: int
+    owned_by: str
+
+class ModelList(BaseModel):
+    object: str
+    data: List[ModelObject]
+
+class ErrorResponse(BaseModel):
+    error: Dict[str, Any]
 
 # Load environment variables
 load_dotenv()
@@ -50,8 +103,17 @@ API_CONNECT_TIMEOUT = float(os.getenv("API_CONNECT_TIMEOUT", "10.0"))  # Default
 API_READ_TIMEOUT = float(os.getenv("API_READ_TIMEOUT", "30.0"))        # Default 30 seconds
 API_TIMEOUT = (API_CONNECT_TIMEOUT, API_READ_TIMEOUT)
 
-app = Flask(__name__)
-CORS(app)
+# Initialize FastAPI app
+app = FastAPI(title="GrokAI OpenAI-compatible API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Current credential index
 current_cred_index = 0
@@ -213,7 +275,6 @@ def download_and_upload_image(grok_client, image_url):
                 temp_file_path = temp_file.name
         else:
             # Handle regular URL
-            import requests
             response = requests.get(image_url, stream=True)
             if response.status_code != 200:
                 print(f"Failed to download image from {image_url}: {response.status_code}")
@@ -257,22 +318,22 @@ def prepare_messages(messages, grok_client):
     # For Grok, we'll include previous messages in the content for context
     context_messages = []
     for i, msg in enumerate(messages[:-1]):
-        if msg["role"] == "system":
-            context_messages.append(f"System: {msg['content']}")
-        elif msg["role"] == "user":
+        if msg.role == "system":
+            context_messages.append(f"System: {msg.content}")
+        elif msg.role == "user":
             # Handle new message format where content could be a list
-            if isinstance(msg['content'], list):
+            if isinstance(msg.content, list):
                 # Extract text parts from the content list
                 text_parts = []
-                for item in msg['content']:
-                    if item['type'] == 'text':
-                        text_parts.append(item['text'])
+                for item in msg.content:
+                    if item.type == 'text':
+                        text_parts.append(item.text)
                 msg_content = " ".join(text_parts)
             else:
-                msg_content = msg['content']
+                msg_content = msg.content
             context_messages.append(f"User: {msg_content}")
-        elif msg["role"] == "assistant":
-            context_messages.append(f"Assistant: {msg['content']}")
+        elif msg.role == "assistant":
+            context_messages.append(f"Assistant: {msg.content}")
     
     context_text = "\n\n".join(context_messages)
     
@@ -281,24 +342,25 @@ def prepare_messages(messages, grok_client):
     
     # Handle new format for the last message
     file_attachments = []
-    if isinstance(last_message.get('content'), list):
+    if isinstance(last_message.content, list):
         # This is the new format with potential images
         text_parts = []
-        for item in last_message['content']:
-            if item['type'] == 'text':
-                text_parts.append(item['text'])
-            elif item['type'] == 'image_url':
+        for item in last_message.content:
+            if item.type == 'text':
+                text_parts.append(item.text)
+            elif item.type == 'image_url':
                 # Process image URL - download and upload it to Grok
-                image_url = item['image_url']['url']
-                uploaded_file = download_and_upload_image(grok_client, image_url)
-                if uploaded_file:
-                    if isinstance(uploaded_file, list):
-                        file_attachments.extend(uploaded_file)  # Extend with the list of uploaded files
-                    else:
-                        file_attachments.append(uploaded_file)  # Append a single uploaded file
+                image_url = item.image_url.get('url')
+                if image_url:
+                    uploaded_file = download_and_upload_image(grok_client, image_url)
+                    if uploaded_file:
+                        if isinstance(uploaded_file, list):
+                            file_attachments.extend(uploaded_file)  # Extend with the list of uploaded files
+                        else:
+                            file_attachments.append(uploaded_file)  # Append a single uploaded file
         last_message_content = " ".join(text_parts)
     else:
-        last_message_content = last_message['content']
+        last_message_content = last_message.content
     
     if context_text:
         # If there's context, include it in the message
@@ -341,13 +403,14 @@ def check_special_keywords(message):
     
     return modified_message, is_deepsearch, is_reasoning
 
-def format_response_to_openai(grok_response, model, is_deepsearch=False):
+def format_response_to_openai(grok_response, model, messages, is_deepsearch=False):
     """
     Formats a Grok response to match the OpenAI API format.
     
     Args:
         grok_response: The raw response from Grok
         model: The model name to include in the response
+        messages: The original request messages
         is_deepsearch: If True, filter for messages with messageTag="final"
     """
     # NOTE: Rate limit checks should always happen on the full response
@@ -395,7 +458,15 @@ def format_response_to_openai(grok_response, model, is_deepsearch=False):
     created_timestamp = int(time.time())
     
     # Very basic token counting (just characters/4)
-    prompt_tokens = sum(len(m.get('content', '')) for m in request.json.get('messages', [])) // 4
+    prompt_tokens = 0
+    for msg in messages:
+        if isinstance(msg.content, str):
+            prompt_tokens += len(msg.content) // 4
+        elif isinstance(msg.content, list):
+            for item in msg.content:
+                if item.type == 'text' and item.text:
+                    prompt_tokens += len(item.text) // 4
+    
     completion_tokens = len(full_message) // 4
     total_tokens = prompt_tokens + completion_tokens
     
@@ -440,7 +511,7 @@ def format_streaming_chunk(text, response_id, model):
     }
     return f"data: {json.dumps(data)}\n\n"
 
-def process_and_stream_grok_response(grok_message_tokens, response_id, model):
+async def process_streaming_grok_response(grok_message_tokens, response_id, model):
     """
     Process Grok message tokens as they arrive and yield formatted chunks for streaming.
     """
@@ -458,28 +529,26 @@ def process_and_stream_grok_response(grok_message_tokens, response_id, model):
     # End the stream
     yield "data: [DONE]\n\n"
 
-@app.route('/v1/models', methods=['GET'])
-def list_models():
+@app.get("/v1/models", response_model=ModelList)
+async def list_models():
     """List available models endpoint."""
     models = [
         {"id": "grok-1", "object": "model", "created": int(time.time()), "owned_by": "Grok"},
         {"id": "grok-2", "object": "model", "created": int(time.time()), "owned_by": "Grok"},
         {"id": "grok-3", "object": "model", "created": int(time.time()), "owned_by": "Grok"}
     ]
-    return jsonify({"object": "list", "data": models})
+    return {"object": "list", "data": models}
 
-@app.route('/v1/chat/completions', methods=['POST'])
-def chat_completions():
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse, responses={500: {"model": ErrorResponse}})
+async def chat_completions(request: ChatCompletionRequest):
     """
     OpenAI-compatible chat completions endpoint.
     """
     try:
-        data = request.json
-        
         # Get request parameters
-        messages = data.get('messages', [])
-        model = data.get('model', 'grok-3')
-        stream = data.get('stream', False)
+        messages = request.messages
+        model = request.model
+        stream = request.stream
         
         # Map model to Grok model
         grok_model = get_grok_model(model)
@@ -510,29 +579,40 @@ def chat_completions():
             last_message_content = ""
             
             # Extract the content from the last message
-            if isinstance(last_message.get('content'), list):
+            if isinstance(last_message.content, list):
                 text_parts = []
-                for item in last_message['content']:
-                    if item['type'] == 'text':
-                        text_parts.append(item['text'])
+                for item in last_message.content:
+                    if item.type == 'text':
+                        text_parts.append(item.text)
                 last_message_content = " ".join(text_parts)
             else:
-                last_message_content = last_message.get('content', '')
+                last_message_content = last_message.content
             
             # Check for special keywords only in the latest query
             modified_query, is_deepsearch, is_reasoning = check_special_keywords(last_message_content)
             
             # Create a copy of the messages with the modified last message
-            modified_messages = messages.copy()
-            if isinstance(modified_messages[-1].get('content'), list):
+            modified_messages = [Message(role=msg.role, content=msg.content) for msg in messages]
+            if isinstance(modified_messages[-1].content, list):
                 # For multimodal messages, update just the text parts
-                for i, item in enumerate(modified_messages[-1]['content']):
-                    if item['type'] == 'text':
-                        modified_messages[-1]['content'][i]['text'] = modified_query
+                new_content = []
+                for item in modified_messages[-1].content:
+                    new_item = MessageContent(**item.dict())
+                    if new_item.type == 'text':
+                        new_item.text = modified_query
                         # Only modify the first text part, leave others unchanged
+                        new_content.append(new_item)
                         break
+                    else:
+                        new_content.append(new_item)
+                
+                # Add remaining items
+                for item in modified_messages[-1].content[len(new_content):]:
+                    new_content.append(item)
+                
+                modified_messages[-1].content = new_content
             else:
-                modified_messages[-1]['content'] = modified_query
+                modified_messages[-1].content = modified_query
             
             # Process messages to fit Grok's format with potential image attachments
             final_message, file_attachments = prepare_messages(modified_messages, grok_client)
@@ -551,45 +631,40 @@ def chat_completions():
             response_id = f"chatcmpl-{uuid.uuid4()}"
             
             if stream:
-                # Create a wrapper function to handle rotation
-                def stream_with_rotation():
+                # Define the streaming generator function
+                async def stream_generator():
                     nonlocal success, retries
                     
-                    # Initialize the stream inside the function to avoid variable scope issues
-                    current_stream = grok_client.send_streaming(request_data, filter_final_only=is_deepsearch)
-                    
                     try:
-                        # Try to stream from the current client
+                        # Get the streaming response
+                        stream = grok_client.send_streaming(request_data, filter_final_only=is_deepsearch)
                         rate_limited = False
                         timeout_occurred = False
-                        
-                        # Buffer for accumulating response lines to check for rate limits
                         response_buffer = []
                         
-                        for message_token in current_stream:
-                            # Check for special tokens from the Grok class
+                        for message_token in stream:
+                            # Check for special tokens
                             if message_token == "__RATE_LIMITED__":
-                                print(f"Rate limited in streaming mode (detected by Grok class)")
+                                print("Rate limited in streaming mode")
                                 rate_limited = True
                                 break
                             elif message_token == "__TIMEOUT__":
-                                print(f"Timeout in streaming mode (detected by Grok class)")
+                                print("Timeout in streaming mode")
                                 timeout_occurred = True
                                 break
                             elif message_token.startswith("__ERROR__"):
                                 print(f"Error in streaming mode: {message_token}")
-                                timeout_occurred = True  # Treat as timeout for retry purposes
+                                timeout_occurred = True
                                 break
                             
                             # Skip thinking traces
                             if isinstance(message_token, str) and message_token.strip():
                                 try:
-                                    # Try to parse as JSON to check for thinking traces
                                     parsed = json.loads(message_token)
                                     result_data = parsed.get("result", {})
                                     if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
                                         continue
-                                except:
+                                except Exception:
                                     # Not JSON or couldn't parse, assume it's safe to keep
                                     pass
                             
@@ -600,7 +675,7 @@ def chat_completions():
                             if len(response_buffer) > 5:
                                 yield format_streaming_chunk(response_buffer.pop(0), response_id, model)
                         
-                        # If rate limited or timeout, try again with a new credential set
+                        # If rate limited or timeout, try again with new credentials
                         if rate_limited or timeout_occurred:
                             retries += 1
                             if retries < max_retries:
@@ -617,201 +692,63 @@ def chat_completions():
                                     )
                                     grok_client.add_user_message(new_request_data, final_message, file_attachments=file_attachments)
                                     
-                                    # Start a new stream with the new request
+                                    # Try with the new credentials
                                     new_stream = grok_client.send_streaming(new_request_data, filter_final_only=is_deepsearch)
-                                    
-                                    # Process the new stream directly (no recursion)
-                                    try:
-                                        for message_token in new_stream:
-                                            # Check for special tokens
-                                            if message_token == "__RATE_LIMITED__" or message_token == "__TIMEOUT__" or message_token.startswith("__ERROR__"):
-                                                print(f"Error in new stream: {message_token}")
-                                                raise Exception(f"Error in new stream: {message_token}")
-                                            
-                                            # Skip thinking traces
-                                            if isinstance(message_token, str) and message_token.strip():
-                                                try:
-                                                    # Try to parse as JSON to check for thinking traces
-                                                    parsed = json.loads(message_token)
-                                                    result_data = parsed.get("result", {})
-                                                    if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                                        continue
-                                                except:
-                                                    # Not JSON or couldn't parse, assume it's safe to keep
-                                                    pass
-                                            
-                                            yield format_streaming_chunk(message_token, response_id, model)
+                                    for token in new_stream:
+                                        # Skip special tokens and thinking traces
+                                        if token in ["__RATE_LIMITED__", "__TIMEOUT__"] or token.startswith("__ERROR__"):
+                                            continue
                                         
-                                        # Send the final chunk after processing all tokens
-                                        yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                        yield "data: [DONE]\n\n"
-                                        success = True
-                                    except Exception as e:
-                                        print(f"Error in new stream after rotation: {str(e)}")
-                                        # Try again with another credential set if available
-                                        if retries < max_retries - 1:
-                                            retries += 1
-                                            rotate_credentials()
-                                            # Create another conversation with the next set of credentials
+                                        # Skip thinking traces
+                                        if isinstance(token, str) and token.strip():
                                             try:
-                                                grok_client.create_conversation()
-                                                newer_request_data = grok_client.create_message(
-                                                    grok_model,
-                                                    isDeepsearch=is_deepsearch,
-                                                    isReasoning=is_reasoning
-                                                )
-                                                grok_client.add_user_message(newer_request_data, final_message, file_attachments=file_attachments)
-                                                
-                                                # Try with the newest credentials
-                                                newest_stream = grok_client.send_streaming(newer_request_data, filter_final_only=is_deepsearch)
-                                                for token in newest_stream:
-                                                    # Check for special tokens
-                                                    if token == "__RATE_LIMITED__" or token == "__TIMEOUT__" or token.startswith("__ERROR__"):
-                                                        print(f"Error in newest stream: {token}")
-                                                        # If we hit another issue, just send what we have and end
-                                                        break
-                                                    
-                                                    # Skip thinking traces
-                                                    if isinstance(token, str) and token.strip():
-                                                        try:
-                                                            # Try to parse as JSON to check for thinking traces
-                                                            parsed = json.loads(token)
-                                                            result_data = parsed.get("result", {})
-                                                            if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                                                continue
-                                                        except:
-                                                            # Not JSON or couldn't parse, assume it's safe to keep
-                                                            pass
-                                                    
-                                                    yield format_streaming_chunk(token, response_id, model)
-                                                
-                                                yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                                yield "data: [DONE]\n\n"
-                                            except Exception as newest_error:
-                                                # Out of options, return an error
-                                                error_msg = f"Error after multiple retries: {str(newest_error)}"
-                                                yield format_streaming_chunk(error_msg, response_id, model)
-                                                yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                                yield "data: [DONE]\n\n"
-                                        else:
-                                            # Out of retries, return an error message
-                                            error_msg = f"Error after {max_retries} retries: {str(e)}"
-                                            yield format_streaming_chunk(error_msg, response_id, model)
-                                            yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                            yield "data: [DONE]\n\n"
+                                                parsed = json.loads(token)
+                                                result_data = parsed.get("result", {})
+                                                if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
+                                                    continue
+                                            except Exception:
+                                                pass
+                                        
+                                        yield format_streaming_chunk(token, response_id, model)
+                                    
+                                    # Send final tokens
+                                    yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
+                                    yield "data: [DONE]\n\n"
+                                    success = True
                                 except Exception as e:
-                                    print(f"Failed to create new conversation: {str(e)}")
-                                    # Out of options, return an error
-                                    error_msg = f"Failed to connect after multiple attempts: {str(e)}"
-                                    yield format_streaming_chunk(error_msg, response_id, model)
+                                    print(f"Error in retry stream: {str(e)}")
+                                    # If all retries failed, return what we have
+                                    for chunk in response_buffer:
+                                        yield format_streaming_chunk(chunk, response_id, model)
                                     yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                     yield "data: [DONE]\n\n"
                             else:
                                 # Out of retries, return what we have
                                 for chunk in response_buffer:
-                                    # Skip thinking traces one more time
-                                    if isinstance(chunk, str) and chunk.strip():
-                                        try:
-                                            # Try to parse as JSON to check for thinking traces
-                                            parsed = json.loads(chunk)
-                                            result_data = parsed.get("result", {})
-                                            if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                                continue
-                                        except:
-                                            # Not JSON or couldn't parse, assume it's safe to keep
-                                            pass
                                     yield format_streaming_chunk(chunk, response_id, model)
                                 yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                 yield "data: [DONE]\n\n"
                         else:
                             # No rate limiting, return remaining buffer
                             for chunk in response_buffer:
-                                # Skip thinking traces one more time
-                                if isinstance(chunk, str) and chunk.strip():
-                                    try:
-                                        # Try to parse as JSON to check for thinking traces
-                                        parsed = json.loads(chunk)
-                                        result_data = parsed.get("result", {})
-                                        if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                            continue
-                                    except:
-                                        # Not JSON or couldn't parse, assume it's safe to keep
-                                        pass
                                 yield format_streaming_chunk(chunk, response_id, model)
                             
                             # Send the final chunk
                             yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                             yield "data: [DONE]\n\n"
-                            
                             success = True
                     except Exception as e:
                         print(f"Error in streaming: {str(e)}")
-                        # If there's an error, try with the next credentials
-                        retries += 1
-                        if retries < max_retries:
-                            rotate_credentials()
-                            
-                            # Create a new conversation with new credentials
-                            try:
-                                grok_client.create_conversation()
-                                retry_request_data = grok_client.create_message(
-                                    grok_model,
-                                    isDeepsearch=is_deepsearch,
-                                    isReasoning=is_reasoning
-                                )
-                                grok_client.add_user_message(retry_request_data, final_message, file_attachments=file_attachments)
-                                
-                                # Create a new stream for the retry
-                                retry_stream = grok_client.send_streaming(retry_request_data, filter_final_only=is_deepsearch)
-                                
-                                # Process the retry stream
-                                try:
-                                    for token in retry_stream:
-                                        # Check for special tokens
-                                        if token == "__RATE_LIMITED__" or token == "__TIMEOUT__" or token.startswith("__ERROR__"):
-                                            print(f"Error in retry stream: {token}")
-                                            # If we hit another issue, just end the stream
-                                            break
-                                        
-                                        # Skip thinking traces one more time
-                                        if isinstance(token, str) and token.strip():
-                                            try:
-                                                # Try to parse as JSON to check for thinking traces
-                                                parsed = json.loads(token)
-                                                result_data = parsed.get("result", {})
-                                                if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                                    continue
-                                            except:
-                                                # Not JSON or couldn't parse, assume it's safe to keep
-                                                pass
-                                        
-                                        yield format_streaming_chunk(token, response_id, model)
-                                    
-                                    yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                    yield "data: [DONE]\n\n"
-                                except Exception as retry_error:
-                                    # Out of retries or another error
-                                    error_msg = f"Error during retry: {str(retry_error)}"
-                                    yield format_streaming_chunk(error_msg, response_id, model)
-                                    yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                    yield "data: [DONE]\n\n"
-                            except Exception as create_error:
-                                # Failed to create new conversation
-                                error_msg = f"Failed to create new conversation: {str(create_error)}"
-                                yield format_streaming_chunk(error_msg, response_id, model)
-                                yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                                yield "data: [DONE]\n\n"
-                        else:
-                            # Out of retries, return an error message
-                            error_msg = f"Error after {max_retries} retries: {str(e)}"
-                            yield format_streaming_chunk(error_msg, response_id, model)
-                            yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
-                            yield "data: [DONE]\n\n"
+                        # Return error message
+                        error_msg = f"Error: {str(e)}"
+                        yield format_streaming_chunk(error_msg, response_id, model)
+                        yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
+                        yield "data: [DONE]\n\n"
                 
-                # Return the streaming response
-                return Response(
-                    stream_with_context(stream_with_rotation()),
-                    content_type='text/event-stream'
+                # Return streaming response
+                return StreamingResponse(
+                    stream_generator(),
+                    media_type="text/event-stream"
                 )
             else:
                 # Non-streaming mode
@@ -842,9 +779,9 @@ def chat_completions():
                             continue
                         
                         # Format the response to match OpenAI's format
-                        openai_response = format_response_to_openai(grok_response, model, is_deepsearch=is_deepsearch)
+                        openai_response = format_response_to_openai(grok_response, model, messages, is_deepsearch=is_deepsearch)
                         success = True
-                        return jsonify(openai_response)
+                        return openai_response
                     
                     except requests.exceptions.Timeout:
                         print(f"Timeout error, rotating credentials (attempt {retries + 1})")
@@ -863,27 +800,33 @@ def chat_completions():
                             break
                 
                 # If we're here, we've exhausted all retries
-                return jsonify({
-                    "error": {
-                        "message": f"Failed after {max_retries} attempts with different credentials",
-                        "type": "connection_error",
-                        "code": 500
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": {
+                            "message": f"Failed after {max_retries} attempts with different credentials",
+                            "type": "connection_error",
+                            "code": 500
+                        }
                     }
-                }), 500
+                )
     
     except Exception as e:
-        return jsonify({
-            "error": {
-                "message": str(e),
-                "type": "api_error",
-                "code": 500
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": str(e),
+                    "type": "api_error",
+                    "code": 500
+                }
             }
-        }), 500
+        )
 
-@app.route('/', methods=['GET'])
-def home():
+@app.get("/")
+async def home():
     """Home endpoint."""
-    return jsonify({
+    return {
         "status": "ok",
         "message": "GrokAI OpenAI-compatible API is running",
         "endpoints": {
@@ -898,7 +841,9 @@ def home():
             "connect_timeout": API_CONNECT_TIMEOUT,
             "read_timeout": API_READ_TIMEOUT
         }
-    })
+    }
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+# Uvicorn startup script
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
