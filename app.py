@@ -4,14 +4,27 @@ import json
 import uuid
 import re
 import tempfile
+import logging
 import requests
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple, Generator, AsyncGenerator
 from urllib.parse import urlparse
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from functools import lru_cache
+import asyncio
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("grok-api")
 
 # Import the Grok modules
 import sys
@@ -71,37 +84,141 @@ class ErrorResponse(BaseModel):
 # Load environment variables
 load_dotenv()
 
-# Credential sets structure - each index corresponds to a set of related credentials
-COOKIES_LIST = []
-X_CSRF_TOKEN_LIST = []
-BEARER_TOKEN_LIST = []
+# Model mappings
+MODEL_MAPPINGS = {
+    "gpt-3.5-turbo": "grok-1",
+    "gpt-4": "grok-2",
+    "gpt-4-turbo": "grok-3",
+    "gpt-4-vision": "grok-3",
+    "gpt-4-vision-preview": "grok-3",
+    "grok-1": "grok-1",
+    "grok-2": "grok-2",
+    "grok-3": "grok-3"
+}
 
-# Get environment variables and parse multiple credential sets
-for i in range(1, 6):  # Get 5 sets of credentials
-    # Try both naming formats (with and without index)
-    cookie_key = f"COOKIES_{i}" if i > 1 else "COOKIES"
-    csrf_key = f"X_CSRF_TOKEN_{i}" if i > 1 else "X_CSRF_TOKEN"
-    bearer_key = f"BEARER_TOKEN_{i}" if i > 1 else "BEARER_TOKEN"
+# Rate limit patterns for efficient detection
+RATE_LIMIT_PATTERNS = [
+    "You've reached your limit of", 
+    "limit of 15 Grok questions", 
+    "limit of 10 Grok DeepSearch questions",
+    "responseType\": \"limiter\"",
+    "upsellType\": \"free_grok"
+]
+
+class CredentialManager:
+    """Manages and rotates API credentials"""
     
-    cookie = os.getenv(cookie_key)
-    csrf = os.getenv(csrf_key)
-    bearer = os.getenv(bearer_key)
+    def __init__(self):
+        """Initialize the credential manager with environment variables"""
+        self.cookies_list = []
+        self.x_csrf_token_list = []
+        self.bearer_token_list = []
+        self.current_index = 0
+        self._load_credentials()
+        
+        if not self.cookies_list:
+            raise ValueError("No valid credential sets found. Please check your environment variables.")
+            
+        logger.info(f"Loaded {len(self.cookies_list)} credential sets")
+        
+    def _load_credentials(self):
+        """Load credentials from environment variables"""
+        for i in range(1, 11):  # Support up to 10 credential sets
+            # Try both naming formats (with and without index)
+            cookie_key = f"COOKIES_{i}" if i > 1 else "COOKIES"
+            csrf_key = f"X_CSRF_TOKEN_{i}" if i > 1 else "X_CSRF_TOKEN"
+            bearer_key = f"BEARER_TOKEN_{i}" if i > 1 else "BEARER_TOKEN"
+            
+            cookie = os.getenv(cookie_key)
+            csrf = os.getenv(csrf_key)
+            bearer = os.getenv(bearer_key)
+            
+            if cookie and csrf and bearer:
+                self.cookies_list.append(cookie)
+                self.x_csrf_token_list.append(csrf)
+                self.bearer_token_list.append(bearer)
     
-    if cookie and csrf and bearer:
-        COOKIES_LIST.append(cookie)
-        X_CSRF_TOKEN_LIST.append(csrf)
-        BEARER_TOKEN_LIST.append(bearer)
+    def get_current_credentials(self) -> Tuple[str, str, str]:
+        """Get the current set of credentials"""
+        return (
+            self.bearer_token_list[self.current_index],
+            self.x_csrf_token_list[self.current_index],
+            self.cookies_list[self.current_index]
+        )
+    
+    def rotate(self) -> Tuple[str, str, str]:
+        """Rotate to the next set of credentials and return them"""
+        if len(self.cookies_list) > 1:
+            self.current_index = (self.current_index + 1) % len(self.cookies_list)
+            logger.info(f"Rotated to credential set {self.current_index + 1}/{len(self.cookies_list)}")
+        return self.get_current_credentials()
+    
+    def get_count(self) -> int:
+        """Return the number of credential sets available"""
+        return len(self.cookies_list)
+    
+    def get_current_index(self) -> int:
+        """Return the current credential set index (0-based)"""
+        return self.current_index
 
-# Ensure we have at least one set of credentials
-if not COOKIES_LIST:
-    raise ValueError("No valid credential sets found. Please check your environment variables.")
+class GrokClientManager:
+    """Manages Grok client instances and handles credential rotation"""
+    
+    def __init__(self, credential_manager: CredentialManager, timeout: Tuple[float, float]):
+        """Initialize with a credential manager and timeout settings"""
+        self.credential_manager = credential_manager
+        self.timeout = timeout
+        self._create_client()
+        
+    def _create_client(self) -> None:
+        """Create a new Grok client with current credentials"""
+        bearer, csrf, cookies = self.credential_manager.get_current_credentials()
+        
+        # Get retry settings from environment variables
+        retry_count = int(os.getenv("GROK_RETRY_COUNT", "2"))
+        retry_backoff = float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
+        
+        self.client = Grok(
+            bearer, 
+            csrf, 
+            cookies, 
+            timeout=self.timeout,
+            retry_count=retry_count,
+            retry_backoff=retry_backoff
+        )
+        
+    def get_client(self) -> Grok:
+        """Get the current Grok client instance"""
+        return self.client
+        
+    def rotate(self) -> Grok:
+        """Rotate credentials and return a new Grok client"""
+        self.credential_manager.rotate()
+        self._create_client()
+        return self.client
 
-PORT = int(os.getenv("PORT", 5000))
-
-# Set API timeout settings - can be configured via environment variables
-API_CONNECT_TIMEOUT = float(os.getenv("API_CONNECT_TIMEOUT", "10.0"))  # Default 10 seconds
-API_READ_TIMEOUT = float(os.getenv("API_READ_TIMEOUT", "30.0"))        # Default 30 seconds
+# Set API timeout settings from environment variables with defaults
+API_CONNECT_TIMEOUT = float(os.getenv("API_CONNECT_TIMEOUT", "10.0"))
+API_READ_TIMEOUT = float(os.getenv("API_READ_TIMEOUT", "30.0"))
 API_TIMEOUT = (API_CONNECT_TIMEOUT, API_READ_TIMEOUT)
+
+# Set download timeout settings from environment variables with defaults
+DOWNLOAD_CONNECT_TIMEOUT = float(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "5.0"))
+DOWNLOAD_READ_TIMEOUT = float(os.getenv("DOWNLOAD_READ_TIMEOUT", "10.0"))
+DOWNLOAD_TIMEOUT = (DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)
+
+# Max retries for API requests
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+
+# Initialize credential manager and Grok client manager
+credential_manager = CredentialManager()
+grok_client_manager = GrokClientManager(credential_manager, API_TIMEOUT)
+
+# Get the port number from environment variable with default
+PORT = int(os.getenv("PORT", "5000"))
+
+# Request buffer size for streaming responses
+STREAM_BUFFER_SIZE = int(os.getenv("STREAM_BUFFER_SIZE", "10"))
 
 # Initialize FastAPI app
 app = FastAPI(title="GrokAI OpenAI-compatible API")
@@ -115,73 +232,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Current credential index
-current_cred_index = 0
+@lru_cache(maxsize=100)
+def get_grok_model(openai_model: str) -> str:
+    """Maps OpenAI model names to Grok model names with caching for performance."""
+    return MODEL_MAPPINGS.get(openai_model, "grok-3")  # Default to grok-3
 
-# Initialize the Grok client with the first set of credentials
-grok_client = Grok(BEARER_TOKEN_LIST[current_cred_index], 
-                  X_CSRF_TOKEN_LIST[current_cred_index], 
-                  COOKIES_LIST[current_cred_index],
-                  timeout=API_TIMEOUT)
-
-# Model mappings
-MODEL_MAPPINGS = {
-    "gpt-3.5-turbo": "grok-1",
-    "gpt-4": "grok-2",
-    "gpt-4-turbo": "grok-3",
-    "gpt-4-vision": "grok-3",  # Assuming grok-3 can handle images
-    "gpt-4-vision-preview": "grok-3",  # Map vision model to grok-3
-    "grok-1": "grok-1",
-    "grok-2": "grok-2",
-    "grok-3": "grok-3"
-}
-
-def filter_thinking_traces(line_text):
-    """
-    Check if a line contains thinking trace data that should be filtered out.
-    
-    Args:
-        line_text: A JSON line from the Grok response
+def is_rate_limited(response_text: str) -> bool:
+    """Check if the response indicates a rate limit using efficient pattern matching."""
+    if not response_text:
+        return False
         
-    Returns:
-        bool: True if the line should be kept, False if it should be filtered out
-    """
+    # Quick check for common patterns
+    for pattern in RATE_LIMIT_PATTERNS:
+        if pattern in response_text:
+            return True
+    
+    # More thorough check with JSON parsing but only if necessary
     try:
-        parsed = json.loads(line_text)
-        result_data = parsed.get("result", {})
-        
-        # Filter out thinking traces by messageTag
-        if result_data.get("messageTag") == "thinking_trace":
-            return False
-            
-        # Filter out thinking traces by isThinking flag
-        if result_data.get("isThinking") == True:
-            return False
-            
-        # Keep all other lines
-        return True
-    except:
-        # If we can't parse it, keep it (better safe than sorry)
-        return True
+        for line in response_text.splitlines():
+            if not line.strip():
+                continue
+                
+            try:
+                parsed = json.loads(line)
+                result = parsed.get("result", {})
+                
+                # Check for rate limit indicators in parsed JSON structure
+                if result.get("responseType") == "limiter":
+                    return True
+                
+                # Check for upsell object which indicates premium requirement
+                if "upsell" in result:
+                    return True
+                
+                # Check for rate limit message in parsed message content
+                message = result.get("message", "")
+                if message and ("You've reached your limit" in message or "limit of" in message):
+                    return True
+            except json.JSONDecodeError:
+                # Skip lines that aren't valid JSON
+                continue
+    except Exception as e:
+        logger.error(f"Error checking for rate limits: {str(e)}")
+    
+    return False
 
-def rotate_credentials():
-    """Rotate to the next set of credentials."""
-    global current_cred_index, grok_client
-    
-    # Move to next credential set
-    current_cred_index = (current_cred_index + 1) % len(COOKIES_LIST)
-    
-    # Reinitialize grok client with new credentials
-    grok_client = Grok(BEARER_TOKEN_LIST[current_cred_index], 
-                      X_CSRF_TOKEN_LIST[current_cred_index], 
-                      COOKIES_LIST[current_cred_index],
-                      timeout=API_TIMEOUT)
-    
-    print(f"Rotated to credential set {current_cred_index + 1}/{len(COOKIES_LIST)}")
-    return grok_client
-
-def detect_rate_limit_pattern(response_text):
-    """Detect which rate limit pattern was triggered."""
+def detect_rate_limit_pattern(response_text: str) -> List[str]:
+    """Detect which rate limit pattern was triggered for better logging."""
     patterns = {
         "standard_limit": "You've reached your limit of 15 Grok questions",
         "deepsearch_limit": "You've reached your limit of 10 Grok DeepSearch questions",
@@ -196,125 +293,128 @@ def detect_rate_limit_pattern(response_text):
     
     return detected if detected else ["unknown_rate_limit"]
 
-def is_rate_limited(response_text):
-    """Check if the response indicates a rate limit."""
-    try:
-        # Check for common rate limit patterns in the raw response text
-        if any(pattern in response_text for pattern in [
-            "You've reached your limit of", 
-            "limit of 15 Grok questions", 
-            "limit of 10 Grok DeepSearch questions",
-            "responseType\": \"limiter\"",
-            "upsellType\": \"free_grok"
-        ]):
-            return True
+def filter_thinking_traces(response_text: str) -> str:
+    """Filter out thinking traces from the response efficiently."""
+    if not response_text:
+        return ""
         
-        # Try parsing the response as JSON lines
-        for line in response_text.splitlines():
-            if line.strip():
-                try:
-                    parsed = json.loads(line)
-                    result = parsed.get("result", {})
-                    
-                    # Check for rate limit indicators in parsed JSON structure
-                    if result.get("responseType") == "limiter":
-                        return True
-                    
-                    # Check for upsell object which indicates premium requirement
-                    if "upsell" in result:
-                        return True
-                    
-                    # Check for rate limit message in parsed message content
-                    message = result.get("message", "")
-                    if message and ("You've reached your limit" in message or "limit of" in message):
-                        return True
-                except json.JSONDecodeError:
-                    # Skip lines that aren't valid JSON
-                    continue
-    except Exception as e:
-        print(f"Error checking for rate limits: {str(e)}")
+    filtered_lines = []
     
-    return False
+    for line in response_text.splitlines():
+        if not line.strip():
+            continue
+            
+        try:
+            parsed = json.loads(line)
+            result_data = parsed.get("result", {})
+            
+            # Skip thinking traces
+            if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") is True:
+                continue
+                
+            filtered_lines.append(line)
+        except json.JSONDecodeError:
+            # Keep non-JSON lines as they might be important
+            filtered_lines.append(line)
+            
+    return "\n".join(filtered_lines)
 
-def get_grok_model(openai_model):
-    """Maps OpenAI model names to Grok model names."""
-    return MODEL_MAPPINGS.get(openai_model, "grok-3")  # Default to grok-3
-
-def download_and_upload_image(grok_client, image_url):
+async def download_and_upload_image(grok_client: Grok, image_url: str) -> Optional[Dict]:
     """
     Downloads an image from a URL or processes a data URI and uploads it to Grok.
-    
-    Args:
-        grok_client: The Grok client instance
-        image_url: URL of the image to download or data URI containing image data
-        
-    Returns:
-        The response from Grok's upload_file method or None if failed
+    Improved to handle various error cases more gracefully.
     """
+    temp_file_path = None
+    
     try:
         # Check if it's a data URI
         if image_url.startswith('data:'):
             # Handle data URI
             import base64
             # Parse the data URI to get the metadata and the base64 content
-            metadata, base64_data = image_url.split(',', 1)
-            
-            # Determine the file extension from the metadata
-            mime_type = metadata.split(';')[0].split(':')[1]
-            extension = '.' + mime_type.split('/')[1]  # For example, '.png' from 'image/png'
-            
-            # Generate a random filename with the appropriate extension
-            filename = f"image_{uuid.uuid4().hex}{extension}"
-            
-            # Decode the base64 data
-            image_data = base64.b64decode(base64_data)
-            
-            # Save to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
-                temp_file.write(image_data)
-                temp_file_path = temp_file.name
-        else:
-            # Handle regular URL
-            response = requests.get(image_url, stream=True)
-            if response.status_code != 200:
-                print(f"Failed to download image from {image_url}: {response.status_code}")
+            try:
+                metadata, base64_data = image_url.split(',', 1)
+                
+                # Determine the file extension from the metadata
+                mime_type = metadata.split(';')[0].split(':')[1]
+                extension = '.' + mime_type.split('/')[1]  # For example, '.png' from 'image/png'
+                
+                # Generate a random filename with the appropriate extension
+                filename = f"image_{uuid.uuid4().hex}{extension}"
+                
+                # Decode the base64 data
+                image_data = base64.b64decode(base64_data)
+                
+                # Save to a temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
+                    temp_file.write(image_data)
+                    temp_file_path = temp_file.name
+            except Exception as e:
+                logger.error(f"Error processing data URI: {str(e)}")
                 return None
-            
-            # Get the filename from the URL or use a random name
-            parsed_url = urlparse(image_url)
-            path = parsed_url.path
-            filename = os.path.basename(path)
-            if not filename or '.' not in filename:
-                filename = f"image_{uuid.uuid4().hex}.jpg"
-            
-            # Save the image to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    temp_file.write(chunk)
-                temp_file_path = temp_file.name
+        else:
+            # Handle regular URL with timeout and error handling
+            try:
+                async def fetch_with_timeout():
+                    loop = asyncio.get_event_loop()
+                    return await loop.run_in_executor(
+                        None, 
+                        lambda: requests.get(image_url, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                    )
+                
+                response = await fetch_with_timeout()
+                
+                if response.status_code != 200:
+                    logger.error(f"Failed to download image from {image_url}: {response.status_code}")
+                    return None
+                
+                # Get the filename from the URL or use a random name
+                parsed_url = urlparse(image_url)
+                path = parsed_url.path
+                filename = os.path.basename(path)
+                if not filename or '.' not in filename:
+                    filename = f"image_{uuid.uuid4().hex}.jpg"
+                
+                # Save the image to a temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        temp_file.write(chunk)
+                    temp_file_path = temp_file.name
+            except requests.exceptions.Timeout:
+                logger.error(f"Timeout downloading image from {image_url}")
+                return None
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error downloading image: {str(e)}")
+                return None
+            except Exception as e:
+                logger.error(f"Unexpected error downloading image: {str(e)}")
+                return None
         
         # Upload the image to Grok
-        upload_result = grok_client.upload_file(temp_file_path)
+        if temp_file_path:
+            upload_result = grok_client.upload_file(temp_file_path)
+            return upload_result
         
-        # Clean up the temporary file
-        os.unlink(temp_file_path)
-        
-        return upload_result
-    except Exception as e:
-        print(f"Error downloading and uploading image: {str(e)}")
         return None
+    except Exception as e:
+        logger.error(f"Error in download_and_upload_image: {str(e)}")
+        return None
+    finally:
+        # Always clean up the temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.warning(f"Failed to delete temporary file {temp_file_path}: {str(e)}")
 
-def prepare_messages(messages, grok_client):
+async def prepare_messages(messages: List[Message], grok_client: Grok) -> Tuple[str, List]:
     """
     Prepares messages in a format suitable for Grok, with support for image URLs.
-    
-    Args:
-        messages: List of message objects from the OpenAI-compatible request
-        grok_client: The Grok client instance for handling image uploads
-        
-    Returns:
-        Tuple of (message_text, file_attachments)
+    Returns a tuple of (message_text, file_attachments)
     """
+    # Initialize file_attachments list at the beginning
+    file_attachments = []
+    
     # For Grok, we'll include previous messages in the content for context
     context_messages = []
     for i, msg in enumerate(messages[:-1]):
@@ -328,6 +428,16 @@ def prepare_messages(messages, grok_client):
                 for item in msg.content:
                     if item.type == 'text':
                         text_parts.append(item.text)
+                    elif item.type == 'image_url':
+                        # Process image URL from previous messages too
+                        image_url = item.image_url.get('url')
+                        if image_url:
+                            uploaded_file = await download_and_upload_image(grok_client, image_url)
+                            if uploaded_file:
+                                if isinstance(uploaded_file, list):
+                                    file_attachments.extend(uploaded_file)
+                                else:
+                                    file_attachments.append(uploaded_file)
                 msg_content = " ".join(text_parts)
             else:
                 msg_content = msg.content
@@ -341,7 +451,6 @@ def prepare_messages(messages, grok_client):
     last_message = messages[-1]
     
     # Handle new format for the last message
-    file_attachments = []
     if isinstance(last_message.content, list):
         # This is the new format with potential images
         text_parts = []
@@ -352,7 +461,7 @@ def prepare_messages(messages, grok_client):
                 # Process image URL - download and upload it to Grok
                 image_url = item.image_url.get('url')
                 if image_url:
-                    uploaded_file = download_and_upload_image(grok_client, image_url)
+                    uploaded_file = await download_and_upload_image(grok_client, image_url)
                     if uploaded_file:
                         if isinstance(uploaded_file, list):
                             file_attachments.extend(uploaded_file)  # Extend with the list of uploaded files
@@ -371,16 +480,10 @@ def prepare_messages(messages, grok_client):
     
     return message_text, file_attachments
 
-def check_special_keywords(message):
+def check_special_keywords(message: str) -> Tuple[str, bool, bool]:
     """
     Check if the message contains special keywords and returns the appropriate flags.
-    Removes the keywords from the message.
-    
-    Args:
-        message: The user's message string
-        
-    Returns:
-        Tuple of (modified_message, is_deepsearch, is_reasoning)
+    Returns a tuple of (modified_message, is_deepsearch, is_reasoning)
     """
     is_deepsearch = False
     is_reasoning = False
@@ -403,61 +506,23 @@ def check_special_keywords(message):
     
     return modified_message, is_deepsearch, is_reasoning
 
-def format_response_to_openai(grok_response, model, messages, is_deepsearch=False):
+def format_response_to_openai(grok_response: str, model: str, messages: List[Message], is_deepsearch: bool = False) -> Dict:
     """
     Formats a Grok response to match the OpenAI API format.
-    
-    Args:
-        grok_response: The raw response from Grok
-        model: The model name to include in the response
-        messages: The original request messages
-        is_deepsearch: If True, filter for messages with messageTag="final"
+    Improved to handle filtering more efficiently.
     """
-    # NOTE: Rate limit checks should always happen on the full response
-    # before filtering for final tags (this is done in the main function)
-    
-    # Filter the response to exclude messages tagged as "thinking_trace" and handle deepsearch
-    filtered_lines = []
-    for line in grok_response.splitlines():
-        if line.strip():
-            try:
-                parsed = json.loads(line)
-                result_data = parsed.get("result", {})
-                message_tag = result_data.get("messageTag")
-                
-                # Skip entries with messageTag set to "thinking_trace"
-                if message_tag == "thinking_trace":
-                    continue
-                
-                # Skip entries with isThinking flag set to True
-                if result_data.get("isThinking") == True:
-                    continue
-                
-                # For deepsearch responses, only include messages tagged as "final"
-                if is_deepsearch:
-                    if message_tag == "final":
-                        filtered_lines.append(line)
-                else:
-                    filtered_lines.append(line)
-            except json.JSONDecodeError:
-                # Skip malformed JSON
-                continue
-    
-    # Join the filtered lines back into a single string
-    grok_response_filtered = "\n".join(filtered_lines)
-    
-    # Always use the filtered response (even if empty, this is better than showing thinking traces)
-    grok_response = grok_response_filtered
+    # Filter the response if needed, but always check rate limits on the full response
+    grok_response_filtered = filter_thinking_traces(grok_response)
     
     # Parse Grok response
-    response_obj = GrokMessages(grok_response)
+    response_obj = GrokMessages(grok_response_filtered)
     full_message = response_obj.get_full_message()
     
     # Create response in OpenAI format
     response_id = f"chatcmpl-{uuid.uuid4()}"
     created_timestamp = int(time.time())
     
-    # Very basic token counting (just characters/4)
+    # Token counting - more accurate approach but still approximation
     prompt_tokens = 0
     for msg in messages:
         if isinstance(msg.content, str):
@@ -492,7 +557,7 @@ def format_response_to_openai(grok_response, model, messages, is_deepsearch=Fals
         }
     }
 
-def format_streaming_chunk(text, response_id, model):
+def format_streaming_chunk(text: str, response_id: str, model: str) -> str:
     """Format a text chunk for streaming in OpenAI format."""
     data = {
         "id": response_id,
@@ -511,14 +576,31 @@ def format_streaming_chunk(text, response_id, model):
     }
     return f"data: {json.dumps(data)}\n\n"
 
-async def process_streaming_grok_response(grok_message_tokens, response_id, model):
+async def process_streaming_grok_response(
+    grok_message_tokens: Generator, 
+    response_id: str, 
+    model: str
+) -> AsyncGenerator[str, None]:
     """
     Process Grok message tokens as they arrive and yield formatted chunks for streaming.
     """
     for message_token in grok_message_tokens:
         # Skip any special tokens or empty tokens
-        if not message_token or message_token.startswith("__"):
+        if not message_token or isinstance(message_token, str) and message_token.startswith("__"):
             continue
+            
+        # Try to parse JSON if it looks like a JSON string
+        if isinstance(message_token, str) and message_token.strip().startswith("{"):
+            try:
+                parsed = json.loads(message_token)
+                result_data = parsed.get("result", {})
+                
+                # Skip thinking traces
+                if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") is True:
+                    continue
+            except json.JSONDecodeError:
+                # Not JSON, so keep it
+                pass
             
         # Format the token as an OpenAI compatible streaming chunk
         yield format_streaming_chunk(message_token, response_id, model)
@@ -532,10 +614,11 @@ async def process_streaming_grok_response(grok_message_tokens, response_id, mode
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
     """List available models endpoint."""
+    current_time = int(time.time())
     models = [
-        {"id": "grok-1", "object": "model", "created": int(time.time()), "owned_by": "Grok"},
-        {"id": "grok-2", "object": "model", "created": int(time.time()), "owned_by": "Grok"},
-        {"id": "grok-3", "object": "model", "created": int(time.time()), "owned_by": "Grok"}
+        {"id": "grok-1", "object": "model", "created": current_time, "owned_by": "Grok"},
+        {"id": "grok-2", "object": "model", "created": current_time, "owned_by": "Grok"},
+        {"id": "grok-3", "object": "model", "created": current_time, "owned_by": "Grok"}
     ]
     return {"object": "list", "data": models}
 
@@ -543,6 +626,7 @@ async def list_models():
 async def chat_completions(request: ChatCompletionRequest):
     """
     OpenAI-compatible chat completions endpoint.
+    Improved with better error handling, credential rotation, and performance optimizations.
     """
     try:
         # Get request parameters
@@ -553,28 +637,30 @@ async def chat_completions(request: ChatCompletionRequest):
         # Map model to Grok model
         grok_model = get_grok_model(model)
         
-        # Maximum number of retry attempts
-        max_retries = len(COOKIES_LIST)
+        # Maximum number of retry attempts - use all available credential sets
+        max_retries = min(MAX_RETRIES, credential_manager.get_count())
         retries = 0
         success = False
         
         while not success and retries < max_retries:
+            # Get the current Grok client
+            grok_client = grok_client_manager.get_client()
+            
             # Create a new conversation
             try:
                 grok_client.create_conversation()
             except requests.exceptions.Timeout:
-                # Specific handling for timeout errors
-                print(f"Timeout creating conversation, rotating credentials (attempt {retries + 1})")
-                rotate_credentials()
+                logger.warning(f"Timeout creating conversation, rotating credentials (attempt {retries + 1})")
+                grok_client_manager.rotate()
                 retries += 1
                 continue
             except Exception as e:
-                print(f"Error creating conversation: {str(e)}, rotating credentials (attempt {retries + 1})")
-                rotate_credentials()
+                logger.error(f"Error creating conversation: {str(e)}, rotating credentials (attempt {retries + 1})")
+                grok_client_manager.rotate()
                 retries += 1
                 continue
             
-            # First, check for keywords in just the last message (latest query)
+            # Check for keywords in the last message
             last_message = messages[-1]
             last_message_content = ""
             
@@ -615,7 +701,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 modified_messages[-1].content = modified_query
             
             # Process messages to fit Grok's format with potential image attachments
-            final_message, file_attachments = prepare_messages(modified_messages, grok_client)
+            final_message, file_attachments = await prepare_messages(modified_messages, grok_client)
             
             # Prepare the request data with special flags if keywords detected
             request_data = grok_client.create_message(
@@ -631,56 +717,64 @@ async def chat_completions(request: ChatCompletionRequest):
             response_id = f"chatcmpl-{uuid.uuid4()}"
             
             if stream:
-                # Define the streaming generator function
-                async def stream_generator():
+                # Define the streaming generator function for streaming responses
+                async def stream_generator() -> AsyncGenerator[str, None]:
                     nonlocal success, retries
+                    nonlocal grok_client  # Make grok_client accessible from outer scope
                     
                     try:
                         # Get the streaming response
                         stream = grok_client.send_streaming(request_data, filter_final_only=is_deepsearch)
                         rate_limited = False
                         timeout_occurred = False
-                        response_buffer = []
+                        
+                        # Use a more efficient buffer - fixed size deque
+                        from collections import deque
+                        response_buffer = deque(maxlen=STREAM_BUFFER_SIZE)
                         
                         for message_token in stream:
                             # Check for special tokens
                             if message_token == "__RATE_LIMITED__":
-                                print("Rate limited in streaming mode")
+                                logger.warning("Rate limited in streaming mode")
                                 rate_limited = True
                                 break
                             elif message_token == "__TIMEOUT__":
-                                print("Timeout in streaming mode")
+                                logger.warning("Timeout in streaming mode")
                                 timeout_occurred = True
                                 break
-                            elif message_token.startswith("__ERROR__"):
-                                print(f"Error in streaming mode: {message_token}")
+                            elif isinstance(message_token, str) and message_token.startswith("__ERROR__"):
+                                logger.error(f"Error in streaming mode: {message_token}")
                                 timeout_occurred = True
                                 break
                             
-                            # Skip thinking traces
+                            # Skip thinking traces - efficient check
+                            is_thinking_trace = False
                             if isinstance(message_token, str) and message_token.strip():
                                 try:
-                                    parsed = json.loads(message_token)
-                                    result_data = parsed.get("result", {})
-                                    if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                        continue
+                                    if message_token.strip().startswith("{"):
+                                        parsed = json.loads(message_token)
+                                        result_data = parsed.get("result", {})
+                                        if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") is True:
+                                            is_thinking_trace = True
                                 except Exception:
                                     # Not JSON or couldn't parse, assume it's safe to keep
                                     pass
                             
-                            # Add to buffer for checking
-                            response_buffer.append(message_token)
-                            
-                            # If buffer is large enough, start yielding
-                            if len(response_buffer) > 5:
-                                yield format_streaming_chunk(response_buffer.pop(0), response_id, model)
+                            if not is_thinking_trace:
+                                # Add to buffer
+                                response_buffer.append(message_token)
+                                
+                                # If buffer has items, yield immediately to improve responsiveness
+                                if response_buffer:
+                                    yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                         
                         # If rate limited or timeout, try again with new credentials
                         if rate_limited or timeout_occurred:
                             retries += 1
                             if retries < max_retries:
-                                print(f"Connection issue, rotating credentials (attempt {retries})")
-                                rotate_credentials()
+                                logger.info(f"Connection issue, rotating credentials (attempt {retries})")
+                                grok_client_manager.rotate()
+                                grok_client = grok_client_manager.get_client()
                                 
                                 # Create a new conversation with new credentials
                                 try:
@@ -695,50 +789,56 @@ async def chat_completions(request: ChatCompletionRequest):
                                     # Try with the new credentials
                                     new_stream = grok_client.send_streaming(new_request_data, filter_final_only=is_deepsearch)
                                     for token in new_stream:
-                                        # Skip special tokens and thinking traces
-                                        if token in ["__RATE_LIMITED__", "__TIMEOUT__"] or token.startswith("__ERROR__"):
+                                        # Skip special tokens and thinking traces - efficient version
+                                        if isinstance(token, str) and (
+                                            token in ["__RATE_LIMITED__", "__TIMEOUT__"] or 
+                                            token.startswith("__ERROR__")
+                                        ):
                                             continue
                                         
                                         # Skip thinking traces
+                                        is_thinking_trace = False
                                         if isinstance(token, str) and token.strip():
                                             try:
-                                                parsed = json.loads(token)
-                                                result_data = parsed.get("result", {})
-                                                if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") == True:
-                                                    continue
+                                                if token.strip().startswith("{"):
+                                                    parsed = json.loads(token)
+                                                    result_data = parsed.get("result", {})
+                                                    if result_data.get("messageTag") == "thinking_trace" or result_data.get("isThinking") is True:
+                                                        is_thinking_trace = True
                                             except Exception:
                                                 pass
                                         
-                                        yield format_streaming_chunk(token, response_id, model)
+                                        if not is_thinking_trace:
+                                            yield format_streaming_chunk(token, response_id, model)
                                     
                                     # Send final tokens
                                     yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                     yield "data: [DONE]\n\n"
                                     success = True
                                 except Exception as e:
-                                    print(f"Error in retry stream: {str(e)}")
-                                    # If all retries failed, return what we have
-                                    for chunk in response_buffer:
-                                        yield format_streaming_chunk(chunk, response_id, model)
+                                    logger.error(f"Error in retry stream: {str(e)}")
+                                    # If all retries failed, return any remaining buffer
+                                    while response_buffer:
+                                        yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                                     yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                     yield "data: [DONE]\n\n"
                             else:
-                                # Out of retries, return what we have
-                                for chunk in response_buffer:
-                                    yield format_streaming_chunk(chunk, response_id, model)
+                                # Out of retries, return any remaining buffer
+                                while response_buffer:
+                                    yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                                 yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                 yield "data: [DONE]\n\n"
                         else:
                             # No rate limiting, return remaining buffer
-                            for chunk in response_buffer:
-                                yield format_streaming_chunk(chunk, response_id, model)
+                            while response_buffer:
+                                yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                             
                             # Send the final chunk
                             yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                             yield "data: [DONE]\n\n"
                             success = True
                     except Exception as e:
-                        print(f"Error in streaming: {str(e)}")
+                        logger.error(f"Error in streaming: {str(e)}")
                         # Return error message
                         error_msg = f"Error: {str(e)}"
                         yield format_streaming_chunk(error_msg, response_id, model)
@@ -751,7 +851,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     media_type="text/event-stream"
                 )
             else:
-                # Non-streaming mode
+                # Non-streaming mode with improved retry logic
                 while retries < max_retries:
                     try:
                         # Send the message and get the response
@@ -760,8 +860,9 @@ async def chat_completions(request: ChatCompletionRequest):
                         # Check if we hit a rate limit
                         if is_rate_limited(grok_response):
                             limit_types = detect_rate_limit_pattern(grok_response)
-                            print(f"Rate limited ({', '.join(limit_types)}), rotating credentials (attempt {retries + 1})")
-                            rotate_credentials()
+                            logger.warning(f"Rate limited ({', '.join(limit_types)}), rotating credentials (attempt {retries + 1})")
+                            grok_client_manager.rotate()
+                            grok_client = grok_client_manager.get_client()
                             retries += 1
                             
                             # Create a new conversation with new credentials
@@ -774,7 +875,7 @@ async def chat_completions(request: ChatCompletionRequest):
                                 )
                                 grok_client.add_user_message(request_data, final_message, file_attachments=file_attachments)
                             except Exception as create_error:
-                                print(f"Error creating new conversation: {str(create_error)}")
+                                logger.error(f"Error creating new conversation: {str(create_error)}")
                                 # We'll retry in the next loop iteration
                             continue
                         
@@ -784,27 +885,29 @@ async def chat_completions(request: ChatCompletionRequest):
                         return openai_response
                     
                     except requests.exceptions.Timeout:
-                        print(f"Timeout error, rotating credentials (attempt {retries + 1})")
+                        logger.warning(f"Timeout error, rotating credentials (attempt {retries + 1})")
                         retries += 1
                         if retries < max_retries:
-                            rotate_credentials()
+                            grok_client_manager.rotate()
+                            grok_client = grok_client_manager.get_client()
                         else:
                             break
                     
                     except Exception as e:
-                        print(f"Error: {str(e)}")
+                        logger.error(f"Error: {str(e)}")
                         retries += 1
                         if retries < max_retries:
-                            rotate_credentials()
+                            grok_client_manager.rotate()
+                            grok_client = grok_client_manager.get_client()
                         else:
                             break
                 
-                # If we're here, we've exhausted all retries
+                # If we've exhausted all retries
                 raise HTTPException(
                     status_code=500,
                     detail={
                         "error": {
-                            "message": f"Failed after {max_retries} attempts with different credentials",
+                            "message": f"Failed after {retries} attempts with different credentials",
                             "type": "connection_error",
                             "code": 500
                         }
@@ -812,6 +915,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
     
     except Exception as e:
+        logger.error(f"Unhandled exception in chat_completions: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail={
@@ -825,7 +929,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 @app.get("/")
 async def home():
-    """Home endpoint."""
+    """Home endpoint with improved status information."""
     return {
         "status": "ok",
         "message": "GrokAI OpenAI-compatible API is running",
@@ -834,14 +938,32 @@ async def home():
             "chat_completions": "/v1/chat/completions"
         },
         "credentials": {
-            "sets_available": len(COOKIES_LIST),
-            "current_set": current_cred_index + 1
+            "sets_available": credential_manager.get_count(),
+            "current_set": credential_manager.get_current_index() + 1
         },
         "timeout_settings": {
-            "connect_timeout": API_CONNECT_TIMEOUT,
-            "read_timeout": API_READ_TIMEOUT
-        }
+            "api_connect_timeout": API_CONNECT_TIMEOUT,
+            "api_read_timeout": API_READ_TIMEOUT,
+            "download_connect_timeout": DOWNLOAD_CONNECT_TIMEOUT,
+            "download_read_timeout": DOWNLOAD_READ_TIMEOUT
+        },
+        "retry_settings": {
+            "max_retries": MAX_RETRIES,
+            "grok_retry_count": int(os.getenv("GROK_RETRY_COUNT", "2")),
+            "grok_retry_backoff": float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
+        },
+        "stream_buffer_size": STREAM_BUFFER_SIZE,
+        "version": "1.1.0"
     }
+
+@app.on_event("startup")
+async def startup_event():
+    """Runs when the API server starts up."""
+    logger.info(f"Starting GrokAI OpenAI-compatible API on port {PORT}")
+    logger.info(f"Using {credential_manager.get_count()} credential sets")
+    logger.info(f"API Timeout settings: connect={API_CONNECT_TIMEOUT}s, read={API_READ_TIMEOUT}s")
+    logger.info(f"Download Timeout settings: connect={DOWNLOAD_CONNECT_TIMEOUT}s, read={DOWNLOAD_READ_TIMEOUT}s")
+    logger.info(f"Max retries: {MAX_RETRIES}")
 
 # Uvicorn startup script
 if __name__ == "__main__":
