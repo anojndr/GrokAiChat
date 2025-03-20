@@ -30,7 +30,7 @@ grok = Grok(
 # Create a conversation
 grok.create_conversation()
 # Send a message
-request_data = grok.create_message("grok-2")
+request_data = grok.create_message("grok-3")
 # Add a user message
 grok.add_user_message(request_data, "Nice write me c++ add function")
 # Send the message
