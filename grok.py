@@ -431,7 +431,8 @@ class Grok:
         eagerTweets: bool = True,
         serverHistory: bool = True,
         isDeepsearch: bool = False,
-        isReasoning: bool = False
+        isReasoning: bool = False,
+        is_deeper_search: bool = False
     ) -> Dict[str, Any]:
         """
         Create a template for the conversation payload using the specified Grok model.
@@ -440,12 +441,23 @@ class Grok:
         conversation_id = self.conversation_info.get("data", {}).get("create_grok_conversation", {}).get("conversation_id")
         if not conversation_id:
             raise ValueError("No active conversation. Call create_conversation() first.")
-            
-        return {
+        
+        # Create base payload with conversationId first
+        payload = {
             "responses": [],
             "systemPromptName": "",
             "grokModelOptionId": model_name,
             "conversationId": conversation_id,
+        }
+        
+        # Add deepsearchArgs if deeper search is enabled
+        if is_deeper_search:
+            payload["deepsearchArgs"] = {
+                "mode": "deeper"
+            }
+        
+        # Add remaining fields
+        payload.update({
             "returnSearchResults": returnSearchResults,
             "returnCitations": returnCitations,
             "promptMetadata": {
@@ -457,11 +469,13 @@ class Grok:
                 "eagerTweets": eagerTweets,
                 "serverHistory": serverHistory
             },
-            "enableSideBySide": True,
+            "enableSideBySide": not (isDeepsearch or is_deeper_search),
             "toolOverrides": {},
             "isDeepsearch": isDeepsearch,
             "isReasoning": isReasoning
-        }
+        })
+        
+        return payload
 
     def add_user_message(
         self,

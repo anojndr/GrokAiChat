@@ -480,20 +480,27 @@ async def prepare_messages(messages: List[Message], grok_client: Grok) -> Tuple[
     
     return message_text, file_attachments
 
-def check_special_keywords(message: str) -> Tuple[str, bool, bool]:
+def check_special_keywords(message: str) -> Tuple[str, bool, bool, bool]:
     """
     Check if the message contains special keywords and returns the appropriate flags.
-    Returns a tuple of (modified_message, is_deepsearch, is_reasoning)
+    Returns a tuple of (modified_message, is_deepsearch, is_reasoning, is_deeper_search)
     """
     is_deepsearch = False
     is_reasoning = False
+    is_deeper_search = False
     modified_message = message
     
     # Convert to lowercase for case-insensitive searching
     message_lower = message.lower()
     
-    # Check for "deepsearch" keyword anywhere in the message
-    if "deepsearch" in message_lower:
+    # Check for "deepersearch" keyword anywhere in the message
+    if "deepersearch" in message_lower:
+        is_deepsearch = True  # Set deepsearch to true for deeper search mode
+        is_deeper_search = True
+        # Remove all instances of "deepersearch" (case insensitive)
+        modified_message = re.sub(r'(?i)deepersearch\s*', '', modified_message).strip()
+    # Check for regular "deepsearch" keyword
+    elif "deepsearch" in message_lower:
         is_deepsearch = True
         # Remove all instances of "deepsearch" (case insensitive)
         modified_message = re.sub(r'(?i)deepsearch\s*', '', modified_message).strip()
@@ -504,7 +511,7 @@ def check_special_keywords(message: str) -> Tuple[str, bool, bool]:
         # Remove all instances of "reasoning" (case insensitive)
         modified_message = re.sub(r'(?i)reasoning\s*', '', modified_message).strip()
     
-    return modified_message, is_deepsearch, is_reasoning
+    return modified_message, is_deepsearch, is_reasoning, is_deeper_search
 
 def format_response_to_openai(grok_response: str, model: str, messages: List[Message], is_deepsearch: bool = False) -> Dict:
     """
@@ -675,7 +682,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 last_message_content = last_message.content
             
             # Check for special keywords only in the latest query
-            modified_query, is_deepsearch, is_reasoning = check_special_keywords(last_message_content)
+            modified_query, is_deepsearch, is_reasoning, is_deeper_search = check_special_keywords(last_message_content)
             
             # Create a copy of the messages with the modified last message
             modified_messages = [Message(role=msg.role, content=msg.content) for msg in messages]
@@ -707,7 +714,8 @@ async def chat_completions(request: ChatCompletionRequest):
             request_data = grok_client.create_message(
                 grok_model,
                 isDeepsearch=is_deepsearch,
-                isReasoning=is_reasoning
+                isReasoning=is_reasoning,
+                is_deeper_search=is_deeper_search
             )
             
             # Add the user message with any file attachments
@@ -782,7 +790,8 @@ async def chat_completions(request: ChatCompletionRequest):
                                     new_request_data = grok_client.create_message(
                                         grok_model,
                                         isDeepsearch=is_deepsearch,
-                                        isReasoning=is_reasoning
+                                        isReasoning=is_reasoning,
+                                        is_deeper_search=is_deeper_search
                                     )
                                     grok_client.add_user_message(new_request_data, final_message, file_attachments=file_attachments)
                                     
@@ -871,7 +880,8 @@ async def chat_completions(request: ChatCompletionRequest):
                                 request_data = grok_client.create_message(
                                     grok_model,
                                     isDeepsearch=is_deepsearch,
-                                    isReasoning=is_reasoning
+                                    isReasoning=is_reasoning,
+                                    is_deeper_search=is_deeper_search
                                 )
                                 grok_client.add_user_message(request_data, final_message, file_attachments=file_attachments)
                             except Exception as create_error:
