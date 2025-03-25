@@ -31,9 +31,9 @@ CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation
 ADD_RESPONSE_URL = "https://api.x.com/2/grok/add_response.json"
 UPLOAD_FILE_URL = "https://x.com/i/api/2/grok/attachment.json"
 
-# Default retry settings - configurable from .env
-DEFAULT_RETRY_COUNT = int(os.getenv("GROK_RETRY_COUNT", "2"))
-DEFAULT_RETRY_BACKOFF = float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
+# Default retry settings - set to 0 to disable internal retries
+DEFAULT_RETRY_COUNT = 0
+DEFAULT_RETRY_BACKOFF = 0
 
 # Pool settings - configurable from .env
 POOL_CONNECTIONS = int(os.getenv("GROK_POOL_CONNECTIONS", "10"))
@@ -186,7 +186,7 @@ class Grok:
     """
     Provides methods to manage Grok interactions such as creating conversations, 
     uploading files, and sending messages.
-    Improved with connection pooling, better error handling, and performance optimizations.
+    Modified to disable internal retries in favor of credential rotation.
     """
     @staticmethod
     def generate_random_base64_string(length=94) -> str:
@@ -227,24 +227,24 @@ class Grok:
             account_bearer_token: Bearer token for authentication
             x_csrf_token: CSRF token for protection against CSRF attacks
             cookies: Cookies string for authentication
-            retry_count: Number of internal retries for transient errors
-            retry_backoff: Backoff multiplier for retries
+            retry_count: Number of internal retries for transient errors (set to 0)
+            retry_backoff: Backoff multiplier for retries (not used when retry_count=0)
         """
         self.session = requests.Session()
         
-        # Set up connection pooling configuration
+        # Set up connection pooling configuration with max_retries=0
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=POOL_CONNECTIONS,
             pool_maxsize=POOL_MAXSIZE,
-            max_retries=retry_count,
+            max_retries=0,  # Disable retries at the adapter level
             pool_block=False
         )
         self.session.mount('https://', adapter)
         self.session.mount('http://', adapter)
         
         self.client_uuid = uuid.uuid4().hex
-        self.retry_count = retry_count
-        self.retry_backoff = retry_backoff
+        self.retry_count = 0  # Force to 0 to ensure no retries
+        self.retry_backoff = 0  # Force to 0 to ensure no backoff
         
         # Generate transaction ID
         self.transaction_id = self.generate_random_base64_string(94)
@@ -490,45 +490,32 @@ class Grok:
             "fileAttachments": file_attachments
         })
     
-    def send(self, request_data: Dict[str, Any], retry_on_error: bool = True) -> str:
+    def send(self, request_data: Dict[str, Any], retry_on_error: bool = False) -> str:
         """
         Send the conversation payload to the server and return the response text.
-        Improved with retry logic for transient errors.
+        Modified to remove retry logic.
         """
-        retries = 0
-        backoff = 1.0
-        
-        while True:
-            try:
-                # Track request for monitoring
-                self.last_request_time = time.time()
-                self.request_count += 1
-                
-                response = self.session.post(
-                    ADD_RESPONSE_URL, 
-                    json=request_data
-                )
-                
-                # Check for HTTP errors
-                response.raise_for_status()
-                return response.text
-                
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"HTTP error sending message: {e.response.status_code} - {e.response.text}")
-                if not retry_on_error or retries >= self.retry_count or e.response.status_code >= 400:
-                    raise
-                retries += 1
-                
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error: {str(e)}")
-                if not retry_on_error or retries >= self.retry_count:
-                    raise
-                retries += 1
-                
-            # Exponential backoff
-            sleep_time = backoff * (self.retry_backoff ** retries)
-            logger.info(f"Retrying in {sleep_time:.2f} seconds (attempt {retries}/{self.retry_count})")
-            time.sleep(sleep_time)
+        try:
+            # Track request for monitoring
+            self.last_request_time = time.time()
+            self.request_count += 1
+            
+            response = self.session.post(
+                ADD_RESPONSE_URL, 
+                json=request_data
+            )
+            
+            # Check for HTTP errors
+            response.raise_for_status()
+            return response.text
+            
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error sending message: {e.response.status_code} - {e.response.text}")
+            raise
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {str(e)}")
+            raise
     
     def _is_rate_limit_response(self, result_data: Dict[str, Any]) -> bool:
         """Check if the result_data indicates a rate limit."""
