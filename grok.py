@@ -31,11 +31,6 @@ CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation
 ADD_RESPONSE_URL = "https://api.x.com/2/grok/add_response.json"
 UPLOAD_FILE_URL = "https://x.com/i/api/2/grok/attachment.json"
 
-# Default timeout settings (in seconds) - configurable from .env
-DEFAULT_CONNECT_TIMEOUT = float(os.getenv("GROK_CONNECT_TIMEOUT", "10.0"))
-DEFAULT_READ_TIMEOUT = float(os.getenv("GROK_READ_TIMEOUT", "30.0"))
-DEFAULT_TIMEOUT = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)  # (connect, read) tuple
-
 # Default retry settings - configurable from .env
 DEFAULT_RETRY_COUNT = int(os.getenv("GROK_RETRY_COUNT", "2"))
 DEFAULT_RETRY_BACKOFF = float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
@@ -222,7 +217,6 @@ class Grok:
         account_bearer_token: str,
         x_csrf_token: str,
         cookies: str,
-        timeout: tuple = DEFAULT_TIMEOUT,
         retry_count: int = DEFAULT_RETRY_COUNT,
         retry_backoff: float = DEFAULT_RETRY_BACKOFF
     ) -> None:
@@ -233,7 +227,6 @@ class Grok:
             account_bearer_token: Bearer token for authentication
             x_csrf_token: CSRF token for protection against CSRF attacks
             cookies: Cookies string for authentication
-            timeout: Request timeout as tuple (connect_timeout, read_timeout) in seconds
             retry_count: Number of internal retries for transient errors
             retry_backoff: Backoff multiplier for retries
         """
@@ -250,7 +243,6 @@ class Grok:
         self.session.mount('http://', adapter)
         
         self.client_uuid = uuid.uuid4().hex
-        self.timeout = timeout
         self.retry_count = retry_count
         self.retry_backoff = retry_backoff
         
@@ -326,8 +318,7 @@ class Grok:
         try:
             response = self.session.post(
                 CREATE_CONVERSATION_URL.format(query_id), 
-                json=data, 
-                timeout=self.timeout
+                json=data
             )
             
             # Raise for HTTP errors
@@ -337,9 +328,6 @@ class Grok:
             conversation_id = self.conversation_info.get('data', {}).get('create_grok_conversation', {}).get('conversation_id', 'unknown')
             logger.info(f"Created conversation: {conversation_id}")
             return conversation_id
-        except requests.exceptions.Timeout as e:
-            logger.error("Timeout error when creating conversation. Check your network connection or X.com API availability.")
-            raise
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error when creating conversation: {e.response.status_code} - {e.response.text}")
             raise
@@ -385,8 +373,7 @@ class Grok:
                 
                 response = self.session.post(
                     UPLOAD_FILE_URL, 
-                    files=files, 
-                    timeout=self.timeout
+                    files=files
                 )
                 
                 # Raise for HTTP errors
@@ -405,9 +392,6 @@ class Grok:
                 response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
                 return response_json
                 
-        except requests.exceptions.Timeout:
-            logger.error("Timeout error when uploading file. Check your network connection or X.com API availability.")
-            raise
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error when uploading file: {e.response.status_code} - {e.response.text}")
             raise
@@ -522,19 +506,12 @@ class Grok:
                 
                 response = self.session.post(
                     ADD_RESPONSE_URL, 
-                    json=request_data, 
-                    timeout=self.timeout
+                    json=request_data
                 )
                 
                 # Check for HTTP errors
                 response.raise_for_status()
                 return response.text
-                
-            except requests.exceptions.Timeout:
-                logger.error("Timeout error when sending message.")
-                if not retry_on_error or retries >= self.retry_count:
-                    raise
-                retries += 1
                 
             except requests.exceptions.HTTPError as e:
                 logger.error(f"HTTP error sending message: {e.response.status_code} - {e.response.text}")
@@ -583,8 +560,7 @@ class Grok:
             with self.session.post(
                 ADD_RESPONSE_URL, 
                 json=request_data, 
-                stream=True, 
-                timeout=self.timeout
+                stream=True
             ) as response:
                 # Check for HTTP errors
                 response.raise_for_status()
@@ -636,9 +612,6 @@ class Grok:
                     except Exception as e:
                         logger.error(f"Error processing streaming response: {str(e)}")
                         
-        except requests.exceptions.Timeout:
-            logger.error("Timeout error during streaming. Check your network connection or X.com API availability.")
-            yield "__TIMEOUT__"
         except requests.exceptions.HTTPError as e:
             logger.error(f"HTTP error during streaming: {e.response.status_code} - {e.response.text}")
             yield f"__ERROR__: HTTP {e.response.status_code}"

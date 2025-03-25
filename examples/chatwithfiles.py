@@ -11,9 +11,7 @@ COOKIES = os.getenv("COOKIES")
 X_CSRF_TOKEN = os.getenv("X_CSRF_TOKEN")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
-# Get timeout settings from .env or use defaults
-CONNECT_TIMEOUT = float(os.getenv("GROK_CONNECT_TIMEOUT", "10.0"))
-READ_TIMEOUT = float(os.getenv("GROK_READ_TIMEOUT", "30.0"))
+# Get retry settings from .env or use defaults
 RETRY_COUNT = int(os.getenv("GROK_RETRY_COUNT", "2"))
 RETRY_BACKOFF = float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
 
@@ -22,7 +20,6 @@ grok = Grok(
     BEARER_TOKEN, 
     X_CSRF_TOKEN, 
     COOKIES, 
-    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
     retry_count=RETRY_COUNT,
     retry_backoff=RETRY_BACKOFF
 )

@@ -164,10 +164,9 @@ class CredentialManager:
 class GrokClientManager:
     """Manages Grok client instances and handles credential rotation"""
     
-    def __init__(self, credential_manager: CredentialManager, timeout: Tuple[float, float]):
-        """Initialize with a credential manager and timeout settings"""
+    def __init__(self, credential_manager: CredentialManager):
+        """Initialize with a credential manager"""
         self.credential_manager = credential_manager
-        self.timeout = timeout
         self._create_client()
         
     def _create_client(self) -> None:
@@ -182,7 +181,6 @@ class GrokClientManager:
             bearer, 
             csrf, 
             cookies, 
-            timeout=self.timeout,
             retry_count=retry_count,
             retry_backoff=retry_backoff
         )
@@ -197,22 +195,12 @@ class GrokClientManager:
         self._create_client()
         return self.client
 
-# Set API timeout settings from environment variables with defaults
-API_CONNECT_TIMEOUT = float(os.getenv("API_CONNECT_TIMEOUT", "10.0"))
-API_READ_TIMEOUT = float(os.getenv("API_READ_TIMEOUT", "30.0"))
-API_TIMEOUT = (API_CONNECT_TIMEOUT, API_READ_TIMEOUT)
-
-# Set download timeout settings from environment variables with defaults
-DOWNLOAD_CONNECT_TIMEOUT = float(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "5.0"))
-DOWNLOAD_READ_TIMEOUT = float(os.getenv("DOWNLOAD_READ_TIMEOUT", "10.0"))
-DOWNLOAD_TIMEOUT = (DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)
-
 # Max retries for API requests
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 # Initialize credential manager and Grok client manager
 credential_manager = CredentialManager()
-grok_client_manager = GrokClientManager(credential_manager, API_TIMEOUT)
+grok_client_manager = GrokClientManager(credential_manager)
 
 # Get the port number from environment variable with default
 PORT = int(os.getenv("PORT", "5000"))
@@ -353,13 +341,13 @@ async def download_and_upload_image(grok_client: Grok, image_url: str) -> Option
                 logger.error(f"Error processing data URI: {str(e)}")
                 return None
         else:
-            # Handle regular URL with timeout and error handling
+            # Handle regular URL with error handling
             try:
                 async def fetch_with_timeout():
                     loop = asyncio.get_event_loop()
                     return await loop.run_in_executor(
                         None, 
-                        lambda: requests.get(image_url, stream=True, timeout=DOWNLOAD_TIMEOUT)
+                        lambda: requests.get(image_url, stream=True)
                     )
                 
                 response = await fetch_with_timeout()
@@ -380,9 +368,6 @@ async def download_and_upload_image(grok_client: Grok, image_url: str) -> Option
                     for chunk in response.iter_content(chunk_size=8192):
                         temp_file.write(chunk)
                     temp_file_path = temp_file.name
-            except requests.exceptions.Timeout:
-                logger.error(f"Timeout downloading image from {image_url}")
-                return None
             except requests.exceptions.RequestException as e:
                 logger.error(f"Request error downloading image: {str(e)}")
                 return None
@@ -656,11 +641,6 @@ async def chat_completions(request: ChatCompletionRequest):
             # Create a new conversation
             try:
                 grok_client.create_conversation()
-            except requests.exceptions.Timeout:
-                logger.warning(f"Timeout creating conversation, rotating credentials (attempt {retries + 1})")
-                grok_client_manager.rotate()
-                retries += 1
-                continue
             except Exception as e:
                 logger.error(f"Error creating conversation: {str(e)}, rotating credentials (attempt {retries + 1})")
                 grok_client_manager.rotate()
@@ -734,7 +714,7 @@ async def chat_completions(request: ChatCompletionRequest):
                         # Get the streaming response
                         stream = grok_client.send_streaming(request_data, filter_final_only=is_deepsearch)
                         rate_limited = False
-                        timeout_occurred = False
+                        error_occurred = False
                         
                         # Use a more efficient buffer - fixed size deque
                         from collections import deque
@@ -746,13 +726,9 @@ async def chat_completions(request: ChatCompletionRequest):
                                 logger.warning("Rate limited in streaming mode")
                                 rate_limited = True
                                 break
-                            elif message_token == "__TIMEOUT__":
-                                logger.warning("Timeout in streaming mode")
-                                timeout_occurred = True
-                                break
-                            elif isinstance(message_token, str) and message_token.startswith("__ERROR__"):
+                            elif message_token.startswith("__ERROR__") if isinstance(message_token, str) else False:
                                 logger.error(f"Error in streaming mode: {message_token}")
-                                timeout_occurred = True
+                                error_occurred = True
                                 break
                             
                             # Skip thinking traces - efficient check
@@ -776,8 +752,8 @@ async def chat_completions(request: ChatCompletionRequest):
                                 if response_buffer:
                                     yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                         
-                        # If rate limited or timeout, try again with new credentials
-                        if rate_limited or timeout_occurred:
+                        # If rate limited or error, try again with new credentials
+                        if rate_limited or error_occurred:
                             retries += 1
                             if retries < max_retries:
                                 logger.info(f"Connection issue, rotating credentials (attempt {retries})")
@@ -800,7 +776,7 @@ async def chat_completions(request: ChatCompletionRequest):
                                     for token in new_stream:
                                         # Skip special tokens and thinking traces - efficient version
                                         if isinstance(token, str) and (
-                                            token in ["__RATE_LIMITED__", "__TIMEOUT__"] or 
+                                            token == "__RATE_LIMITED__" or 
                                             token.startswith("__ERROR__")
                                         ):
                                             continue
@@ -894,15 +870,6 @@ async def chat_completions(request: ChatCompletionRequest):
                         success = True
                         return openai_response
                     
-                    except requests.exceptions.Timeout:
-                        logger.warning(f"Timeout error, rotating credentials (attempt {retries + 1})")
-                        retries += 1
-                        if retries < max_retries:
-                            grok_client_manager.rotate()
-                            grok_client = grok_client_manager.get_client()
-                        else:
-                            break
-                    
                     except Exception as e:
                         logger.error(f"Error: {str(e)}")
                         retries += 1
@@ -951,12 +918,6 @@ async def home():
             "sets_available": credential_manager.get_count(),
             "current_set": credential_manager.get_current_index() + 1
         },
-        "timeout_settings": {
-            "api_connect_timeout": API_CONNECT_TIMEOUT,
-            "api_read_timeout": API_READ_TIMEOUT,
-            "download_connect_timeout": DOWNLOAD_CONNECT_TIMEOUT,
-            "download_read_timeout": DOWNLOAD_READ_TIMEOUT
-        },
         "retry_settings": {
             "max_retries": MAX_RETRIES,
             "grok_retry_count": int(os.getenv("GROK_RETRY_COUNT", "2")),
@@ -971,8 +932,6 @@ async def startup_event():
     """Runs when the API server starts up."""
     logger.info(f"Starting GrokAI OpenAI-compatible API on port {PORT}")
     logger.info(f"Using {credential_manager.get_count()} credential sets")
-    logger.info(f"API Timeout settings: connect={API_CONNECT_TIMEOUT}s, read={API_READ_TIMEOUT}s")
-    logger.info(f"Download Timeout settings: connect={DOWNLOAD_CONNECT_TIMEOUT}s, read={DOWNLOAD_READ_TIMEOUT}s")
     logger.info(f"Max retries: {MAX_RETRIES}")
 
 # Uvicorn startup script
