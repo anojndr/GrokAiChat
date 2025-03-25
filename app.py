@@ -195,7 +195,7 @@ class GrokClientManager:
         self._create_client()
         return self.client
 
-# Max retries for API requests
+# Max retries for API requests - we keep this for backward compatibility
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
 # Initialize credential manager and Grok client manager
@@ -629,12 +629,16 @@ async def chat_completions(request: ChatCompletionRequest):
         # Map model to Grok model
         grok_model = get_grok_model(model)
         
-        # Maximum number of retry attempts - use all available credential sets
-        max_retries = min(MAX_RETRIES, credential_manager.get_count())
+        # Use all available credential sets
+        total_credentials = credential_manager.get_count()
+        if total_credentials == 0:
+            raise ValueError("No credentials available")
+            
         retries = 0
         success = False
         
-        while not success and retries < max_retries:
+        # Try until success or until we've tried all credential sets
+        while not success and retries < total_credentials:
             # Get the current Grok client
             grok_client = grok_client_manager.get_client()
             
@@ -642,7 +646,7 @@ async def chat_completions(request: ChatCompletionRequest):
             try:
                 grok_client.create_conversation()
             except Exception as e:
-                logger.error(f"Error creating conversation: {str(e)}, rotating credentials (attempt {retries + 1})")
+                logger.error(f"Error creating conversation: {str(e)}, rotating credentials (attempt {retries + 1}/{total_credentials})")
                 grok_client_manager.rotate()
                 retries += 1
                 continue
@@ -709,6 +713,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 async def stream_generator() -> AsyncGenerator[str, None]:
                     nonlocal success, retries
                     nonlocal grok_client  # Make grok_client accessible from outer scope
+                    nonlocal total_credentials  # Access to total credentials count
                     
                     try:
                         # Get the streaming response
@@ -755,8 +760,8 @@ async def chat_completions(request: ChatCompletionRequest):
                         # If rate limited or error, try again with new credentials
                         if rate_limited or error_occurred:
                             retries += 1
-                            if retries < max_retries:
-                                logger.info(f"Connection issue, rotating credentials (attempt {retries})")
+                            if retries < total_credentials:
+                                logger.info(f"Connection issue, rotating credentials (attempt {retries}/{total_credentials})")
                                 grok_client_manager.rotate()
                                 grok_client = grok_client_manager.get_client()
                                 
@@ -808,7 +813,11 @@ async def chat_completions(request: ChatCompletionRequest):
                                     yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
                                     yield "data: [DONE]\n\n"
                             else:
-                                # Out of retries, return any remaining buffer
+                                # Out of retries (tried all credentials), return error message and any remaining buffer
+                                error_msg = "Error: Exhausted all available credential sets without success"
+                                yield format_streaming_chunk(error_msg, response_id, model)
+                                
+                                # Return any remaining buffer
                                 while response_buffer:
                                     yield format_streaming_chunk(response_buffer.popleft(), response_id, model)
                                 yield format_streaming_chunk("", response_id, model).replace('"finish_reason": null', '"finish_reason": "stop"')
@@ -837,15 +846,21 @@ async def chat_completions(request: ChatCompletionRequest):
                 )
             else:
                 # Non-streaming mode with improved retry logic
-                while retries < max_retries:
+                tried_credentials = set()  # Track which credential sets we've tried
+                
+                while retries < total_credentials:
                     try:
+                        # Keep track of which credential index we're using
+                        current_cred_index = credential_manager.get_current_index()
+                        tried_credentials.add(current_cred_index)
+                        
                         # Send the message and get the response
                         grok_response = grok_client.send(request_data)
                         
                         # Check if we hit a rate limit
                         if is_rate_limited(grok_response):
                             limit_types = detect_rate_limit_pattern(grok_response)
-                            logger.warning(f"Rate limited ({', '.join(limit_types)}), rotating credentials (attempt {retries + 1})")
+                            logger.warning(f"Rate limited ({', '.join(limit_types)}), rotating credentials (attempt {retries + 1}/{total_credentials})")
                             grok_client_manager.rotate()
                             grok_client = grok_client_manager.get_client()
                             retries += 1
@@ -873,18 +888,18 @@ async def chat_completions(request: ChatCompletionRequest):
                     except Exception as e:
                         logger.error(f"Error: {str(e)}")
                         retries += 1
-                        if retries < max_retries:
+                        if retries < total_credentials:
                             grok_client_manager.rotate()
                             grok_client = grok_client_manager.get_client()
                         else:
                             break
                 
-                # If we've exhausted all retries
+                # If we've exhausted all credentials
                 raise HTTPException(
                     status_code=500,
                     detail={
                         "error": {
-                            "message": f"Failed after {retries} attempts with different credentials",
+                            "message": f"Failed after trying all {total_credentials} credential sets",
                             "type": "connection_error",
                             "code": 500
                         }
@@ -919,12 +934,12 @@ async def home():
             "current_set": credential_manager.get_current_index() + 1
         },
         "retry_settings": {
-            "max_retries": MAX_RETRIES,
+            "max_possible_retries": credential_manager.get_count(),  # Updated to show total credentials as max retries
             "grok_retry_count": int(os.getenv("GROK_RETRY_COUNT", "2")),
             "grok_retry_backoff": float(os.getenv("GROK_RETRY_BACKOFF", "1.5"))
         },
         "stream_buffer_size": STREAM_BUFFER_SIZE,
-        "version": "1.1.0"
+        "version": "1.1.1"  # Incremented version number
     }
 
 @app.on_event("startup")
@@ -932,7 +947,7 @@ async def startup_event():
     """Runs when the API server starts up."""
     logger.info(f"Starting GrokAI OpenAI-compatible API on port {PORT}")
     logger.info(f"Using {credential_manager.get_count()} credential sets")
-    logger.info(f"Max retries: {MAX_RETRIES}")
+    logger.info(f"Max possible retries: {credential_manager.get_count()}")  # Updated log message
 
 # Uvicorn startup script
 if __name__ == "__main__":
