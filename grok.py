@@ -28,7 +28,7 @@ logger = logging.getLogger("grok-client")
 
 # API endpoints
 CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation"
-ADD_RESPONSE_URL = "https://api.x.com/2/grok/add_response.json"
+ADD_RESPONSE_URL = "https://grok.x.com/2/grok/add_response.json"
 UPLOAD_FILE_URL = "https://x.com/i/api/2/grok/attachment.json"
 
 # Default retry settings - set to 0 to disable internal retries
@@ -271,9 +271,11 @@ class Grok:
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
             "authorization": f"Bearer {account_bearer_token}",
+            "cache-control": "no-cache",
             "content-type": "application/json",
             "cookie": cookies,
             "origin": "https://x.com",
+            "pragma": "no-cache",
             "priority": "u=1, i",
             "referer": "https://x.com/i/grok",
             "sec-ch-ua": "\"Chromium\";v=\"134\", \"Not:A-Brand\";v=\"24\", \"Google Chrome\";v=\"134\"",
