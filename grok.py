@@ -3,59 +3,37 @@ Name: Vibhek Soni
 Age: 19
 Github: https://github.com/vibheksoni
 """
-import requests
-import uuid
-import json
-import mimetypes
-import base64
-import secrets
-import logging
+import requests, uuid, json, mimetypes, time, asyncio
 import os
-from typing import List, Optional, Dict, Any, Generator, Tuple, Union
-import time
-from functools import lru_cache
-from dotenv import load_dotenv
+from typing import List, Optional, Union, Literal, Dict, Any, AsyncGenerator
+import aiohttp
+import logging
 
-# Load environment variables
-load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("grok-client")
-
-# API endpoints
 CREATE_CONVERSATION_URL = "https://x.com/i/api/graphql/{}/CreateGrokConversation"
 ADD_RESPONSE_URL = "https://grok.x.com/2/grok/add_response.json"
 UPLOAD_FILE_URL = "https://x.com/i/api/2/grok/attachment.json"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+DEFAULT_QUERY_ID = "vvC5uy7pWWHXS2aDi1FZeA"
+MAX_RETRIES_PER_CREDENTIAL = 1
 
-# Default retry settings - set to 0 to disable internal retries
-DEFAULT_RETRY_COUNT = 0
-DEFAULT_RETRY_BACKOFF = 0
-
-# Pool settings - configurable from .env
-POOL_CONNECTIONS = int(os.getenv("GROK_POOL_CONNECTIONS", "10"))
-POOL_MAXSIZE = int(os.getenv("GROK_POOL_MAXSIZE", "20"))
+class AllCredentialsLimitedError(Exception):
+    """Raised when all available credentials hit the rate limiter."""
+    pass
 
 class GrokMessages:
     """
     Represents a collection of conversation results parsed from raw JSON lines.
-    Optimized for performance and memory usage.
     """
     class Result:
         """
         Represents a single result entry with optional fields like message, query, feedbackLabels, etc.
         """
-        __slots__ = (
-            'sender', 'message', 'query', 'feedback_labels', 'follow_up_suggestions',
-            'tools_used', 'cited_web_results', 'web_results', 'media_post_ids', 'post_ids'
-        )
-        
         def __init__(
             self,
-            sender: Optional[str] = None,
+            sender: str,
             message: Optional[str] = None,
             query: Optional[str] = None,
             feedback_labels: Optional[List[dict]] = None,
@@ -64,7 +42,8 @@ class GrokMessages:
             cited_web_results: Optional[List[dict]] = None,
             web_results: Optional[List[dict]] = None,
             media_post_ids: Optional[List[str]] = None,
-            post_ids: Optional[List[str]] = None
+            post_ids: Optional[List[str]] = None,
+            response_type: Optional[str] = None
         ) -> None:
             self.sender = sender
             self.message = message
@@ -76,9 +55,10 @@ class GrokMessages:
             self.web_results = web_results
             self.media_post_ids = media_post_ids
             self.post_ids = post_ids
+            self.response_type = response_type
 
         def __repr__(self) -> str:
-            return f"<Result(sender={self.sender}, message={self.message[:30] + '...' if self.message and len(self.message) > 30 else self.message})>"
+            return f"<Result(sender={self.sender}, message={self.message}, type={self.response_type})>"
 
     def __init__(self, raw_data: str) -> None:
         """
@@ -91,30 +71,13 @@ class GrokMessages:
     def _parse_raw_data(self) -> None:
         """
         Split the raw data by lines and convert each line to a Result object stored in self.results.
-        Optimized to handle invalid JSON and thinking traces more efficiently.
         """
-        if not self.raw_data:
-            return
-            
-        lines = self.raw_data.splitlines()
+        lines = self.raw_data.strip().splitlines()
         for line in lines:
-            if not line.strip():
-                continue
-                
-            try:
-                # Only parse JSON if the line starts with a curly brace
-                if line.strip().startswith("{"):
+            if line.strip():
+                try:
                     parsed = json.loads(line)
                     result_data = parsed.get("result", {})
-                    
-                    # Skip entries with messageTag set to "thinking_trace"
-                    if result_data.get("messageTag") == "thinking_trace":
-                        continue
-                        
-                    # Additional check for thinking traces
-                    if result_data.get("isThinking") is True:
-                        continue
-                    
                     result = self.Result(
                         sender=result_data.get("sender"),
                         message=result_data.get("message"),
@@ -126,324 +89,343 @@ class GrokMessages:
                         web_results=result_data.get("webResults"),
                         media_post_ids=result_data.get("xMediaPostIds"),
                         post_ids=result_data.get("xPostIds"),
+                        response_type=result_data.get("responseType")
                     )
                     self.results.append(result)
-            except json.JSONDecodeError:
-                # Skip malformed JSON
-                continue
-            except Exception as e:
-                logger.error(f"Error parsing result: {str(e)}")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse line: {line}. Error: {e}")
 
-    @lru_cache(maxsize=1)
     def get_message_tokens(self) -> List[str]:
         """
         Return a list of message tokens from the parsed results.
-        Cached for performance.
         """
-        return [result.message for result in self.results if result.message]
+        return [result.message for result in self.results if result.message is not None]
 
-    @lru_cache(maxsize=1)
     def get_full_message(self) -> str:
         """
         Return the full message from the parsed results.
-        Cached for performance.
         """
         return ''.join(self.get_message_tokens())
 
+    def is_limiter_response(self) -> bool:
+        """Check if any result in the response indicates a rate limit."""
+        return any(result.response_type == "limiter" for result in self.results)
+
     def get_queries(self) -> List[str]:
-        """Return all query strings from the parsed results."""
         return [result.query for result in self.results if result.query]
 
     def get_feedback_labels(self) -> List[dict]:
-        """Return a list of feedback label objects."""
         return [result.feedback_labels for result in self.results if result.feedback_labels]
 
     def get_follow_up_suggestions(self) -> List[dict]:
-        """Return a list of follow-up suggestion objects."""
         return [result.follow_up_suggestions for result in self.results if result.follow_up_suggestions]
 
     def get_tools_used(self) -> List[dict]:
-        """Return a list of tools used (metadata) from the parsed results."""
         return [result.tools_used for result in self.results if result.tools_used]
 
     def get_cited_web_results(self) -> List[dict]:
-        """Return a list of cited web results."""
         return [result.cited_web_results for result in self.results if result.cited_web_results]
 
     def get_web_results(self) -> List[dict]:
-        """Return a list of web results."""
         return [result.web_results for result in self.results if result.web_results]
 
     def get_media_post_ids(self) -> List[List[str]]:
-        """Return a list of lists containing media post IDs."""
         return [result.media_post_ids for result in self.results if result.media_post_ids]
 
     def get_post_ids(self) -> List[List[str]]:
-        """Return a list of lists containing post IDs."""
         return [result.post_ids for result in self.results if result.post_ids]
+
 
 class Grok:
     """
-    Provides methods to manage Grok interactions such as creating conversations, 
-    uploading files, and sending messages.
-    Modified to disable internal retries in favor of credential rotation.
+    Provides methods to manage Grok interactions with credential rotation and retry logic.
+    Cycles through provided credentials if a rate limit ('limiter') response is detected.
     """
-    @staticmethod
-    def generate_random_base64_string(length=94) -> str:
-        """
-        Generate a random Base64 string of specified length.
-        
-        Args:
-            length: The desired length of the output string
-            
-        Returns:
-            A random Base64 string of the specified length
-        """
-        # Calculate how many random bytes we need
-        # Base64 encodes 3 bytes into 4 characters
-        byte_length = (length * 3) // 4 + 1
-        
-        # Generate random bytes using cryptographically secure random generator
-        random_bytes = secrets.token_bytes(byte_length)
-        
-        # Encode the bytes as Base64
-        base64_string = base64.b64encode(random_bytes).decode('utf-8')
-        
-        # Trim to the desired length and return
-        return base64_string[:length]
-        
     def __init__(
         self,
-        account_bearer_token: str,
-        x_csrf_token: str,
-        cookies: str,
-        retry_count: int = DEFAULT_RETRY_COUNT,
-        retry_backoff: float = DEFAULT_RETRY_BACKOFF
+        credential_sets: List[Dict[str, str]]
     ) -> None:
         """
-        Initialize a requests session and store relevant headers.
-        
-        Args:
-            account_bearer_token: Bearer token for authentication
-            x_csrf_token: CSRF token for protection against CSRF attacks
-            cookies: Cookies string for authentication
-            retry_count: Number of internal retries for transient errors (set to 0)
-            retry_backoff: Backoff multiplier for retries (not used when retry_count=0)
+        Initialize with a list of credential sets.
+        Each set should be a dict: {"bearer": "...", "csrf": "...", "cookies": "..."}
         """
+        if not credential_sets:
+             raise ValueError("At least one credential set must be provided.")
+
+        self.credential_sets = credential_sets
+        self.num_credentials = len(credential_sets)
+        self.current_cred_index = -1
+
         self.session = requests.Session()
-        
-        # Set up connection pooling configuration with max_retries=0
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=POOL_CONNECTIONS,
-            pool_maxsize=POOL_MAXSIZE,
-            max_retries=0,  # Disable retries at the adapter level
-            pool_block=False
-        )
-        self.session.mount('https://', adapter)
-        self.session.mount('http://', adapter)
-        
         self.client_uuid = uuid.uuid4().hex
-        self.retry_count = 0  # Force to 0 to ensure no retries
-        self.retry_backoff = 0  # Force to 0 to ensure no backoff
-        
-        # Generate transaction ID
-        self.transaction_id = self.generate_random_base64_string(94)
-        
-        # Clean and prepare headers
-        self._prepare_headers(account_bearer_token, x_csrf_token, cookies)
-        
-        self.conversation_info = {
-            "data": {
-                "create_grok_conversation": {
-                    "conversation_id": ""
-                }
-            }
-        }
-        
-        # Stats for monitoring
-        self.request_count = 0
-        self.last_request_time = 0
-    
-    def _prepare_headers(self, account_bearer_token: str, x_csrf_token: str, cookies: str) -> None:
-        """Prepare and sanitize request headers"""
+
+        self.bearer_token: Optional[str] = None
+        self.csrf_token: Optional[str] = None
+        self.cookies: Optional[str] = None
+        self.current_headers: Dict[str, str] = {}
+
+        self._switch_credentials(0)
+
+    def _switch_credentials(self, index: int) -> None:
+        """Switches to the credential set at the given index and updates headers."""
+        if not (0 <= index < self.num_credentials):
+            raise IndexError("Credential index out of bounds.")
+
+        self.current_cred_index = index
+        current_creds = self.credential_sets[index]
+        self.bearer_token = current_creds.get("bearer")
+        self.csrf_token = current_creds.get("csrf")
+        self.cookies = current_creds.get("cookies")
+
+        if not all([self.bearer_token, self.csrf_token, self.cookies]):
+             logger.warning(f"Credential set at index {index} is incomplete. Missing bearer, csrf, or cookies.")
+
+        logger.info(f"Switched to credential set #{index + 1}/{self.num_credentials}")
+        self._update_headers()
+
+    def _get_next_credentials(self) -> bool:
+        """Cycles to the next credential set. Returns True if wrapped around, False otherwise."""
+        next_index = (self.current_cred_index + 1) % self.num_credentials
+        wrapped = next_index == 0
+        self._switch_credentials(next_index)
+        return wrapped
+
+    def _update_headers(self) -> None:
+        """Sets or updates the session headers and the self.current_headers dict."""
         headers = {
             "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-encoding": "gzip, deflate, br",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {account_bearer_token}",
-            "cache-control": "no-cache",
+            "authorization": f"Bearer {self.bearer_token}",
             "content-type": "application/json",
-            "cookie": cookies,
+            "cookie": self.cookies,
             "origin": "https://x.com",
-            "pragma": "no-cache",
             "priority": "u=1, i",
             "referer": "https://x.com/i/grok",
-            "sec-ch-ua": "\"Chromium\";v=\"134\", \"Not:A-Brand\";v=\"24\", \"Google Chrome\";v=\"134\"",
+            "sec-ch-ua": "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": "\"Windows\"",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-            "x-client-transaction-id": self.transaction_id,
+            "user-agent": DEFAULT_USER_AGENT,
             "x-client-uuid": self.client_uuid,
-            "x-csrf-token": x_csrf_token,
+            "x-csrf-token": self.csrf_token,
             "x-twitter-active-user": "yes",
             "x-twitter-auth-type": "OAuth2Session",
             "x-twitter-client-language": "en"
         }
-        
-        # Clean headers to ensure valid ASCII characters
-        sanitized_headers = {}
-        for key, value in headers.items():
-            if isinstance(value, str):
-                # Replace any problematic Unicode characters with ASCII equivalents
-                sanitized_value = value.replace("\u2026", "...").encode('ascii', 'ignore').decode('ascii')
-                sanitized_headers[key] = sanitized_value
-            else:
-                sanitized_headers[key] = value
-        
-        self.session.headers.update(sanitized_headers)
-    
-    def create_conversation(self) -> str:
+        self.session.headers.clear()
+        self.session.headers.update(headers)
+        self.current_headers = headers
+
+    async def _execute_with_retry(self, func, *args, **kwargs):
         """
-        Create a new Grok conversation and store the conversation info.
-        Returns the conversation ID.
+        Executes an async function with credential rotation on limiter errors.
+        `func` should be an async function that returns a response object or raises an exception.
+        It expects the response object to have a `text` attribute (or be awaitable for text)
+        and potentially a `status` attribute.
         """
-        query_id = "vvC5uy7pWWHXS2aDi1FZeA"
-        data = {"variables":{},"queryId":query_id}
-        
-        # Track request time for rate limiting and monitoring
-        self.last_request_time = time.time()
-        self.request_count += 1
-        
-        try:
-            response = self.session.post(
-                CREATE_CONVERSATION_URL.format(query_id), 
-                json=data
+        initial_cred_index = self.current_cred_index
+        attempt_count = 0
+
+        while attempt_count < self.num_credentials:
+            current_index_for_attempt = self.current_cred_index
+            logger.debug(f"Attempt {attempt_count + 1}/{self.num_credentials} using credential #{current_index_for_attempt + 1}")
+            try:
+                response = await func(*args, **kwargs)
+
+
+                response_text = ""
+                is_limiter = False
+
+                if isinstance(response, requests.Response):
+                    response.raise_for_status()
+                    response_text = response.text
+                    try:
+                        parsed_data = json.loads(response_text)
+                        if isinstance(parsed_data, list):
+                             for item in parsed_data:
+                                 if item.get("result", {}).get("responseType") == "limiter":
+                                     is_limiter = True
+                                     break
+                        elif parsed_data.get("result", {}).get("responseType") == "limiter":
+                            is_limiter = True
+                        elif "data" in parsed_data and "create_grok_conversation" in parsed_data["data"] and \
+                             parsed_data["data"]["create_grok_conversation"] is None and "errors" in parsed_data:
+                             if any("rate limit" in err.get("message","").lower() for err in parsed_data.get("errors",[])):
+                                 is_limiter = True
+                                 logger.warning("Detected potential rate limit from GraphQL errors.")
+
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"Error checking non-streaming response for limiter: {e}")
+
+
+                if is_limiter:
+                    logger.warning(f"Limiter detected for credential #{current_index_for_attempt + 1}. Switching credentials.")
+                    wrapped = self._get_next_credentials()
+                    attempt_count += 1
+                    if wrapped and attempt_count >= self.num_credentials:
+                        raise AllCredentialsLimitedError("All credentials hit the rate limiter.")
+                    await asyncio.sleep(1)
+                    continue
+
+                return response
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request failed for credential #{current_index_for_attempt + 1}: {e}")
+                is_limiter_http = False
+                if e.response is not None:
+                    if e.response.status_code == 429:
+                        is_limiter_http = True
+                        logger.warning(f"HTTP 429 (Too Many Requests) received for credential #{current_index_for_attempt + 1}.")
+                    else:
+                        try:
+                            error_json = e.response.json()
+                            if error_json.get("result", {}).get("responseType") == "limiter":
+                                is_limiter_http = True
+                                logger.warning(f"Limiter JSON found in error response body for credential #{current_index_for_attempt + 1}.")
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                if is_limiter_http:
+                    wrapped = self._get_next_credentials()
+                    attempt_count += 1
+                    if wrapped and attempt_count >= self.num_credentials:
+                        raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP 429 or error body).")
+                    await asyncio.sleep(1)
+                    continue
+
+                raise ConnectionError(f"Request failed: {e}") from e
+
+            except (json.JSONDecodeError, KeyError, AttributeError, IndexError) as e:
+                 logger.error(f"Error processing response for credential #{current_index_for_attempt + 1}: {e}")
+                 raise ConnectionError(f"Failed to process response: {e}") from e
+
+            except Exception as e:
+                logger.error(f"Unexpected error during request with credential #{current_index_for_attempt + 1}: {e.__class__.__name__}: {e}")
+                raise
+
+        raise AllCredentialsLimitedError("Failed to get a successful response after trying all credentials.")
+
+
+    async def create_new_conversation(self) -> str:
+        """
+        Creates a *new* Grok conversation, handling retries on limiter errors. (Async)
+        """
+        logger.info("Attempting to create new Grok conversation...")
+        query_id = DEFAULT_QUERY_ID
+        data = {"variables": {}, "queryId": query_id}
+        url = CREATE_CONVERSATION_URL.format(query_id)
+
+        async def _make_request():
+            return await asyncio.to_thread(
+                self.session.post,
+                url,
+                json=data,
+                timeout=20
             )
-            
-            # Raise for HTTP errors
-            response.raise_for_status()
-            
-            self.conversation_info = response.json()
-            conversation_id = self.conversation_info.get('data', {}).get('create_grok_conversation', {}).get('conversation_id', 'unknown')
-            logger.info(f"Created conversation: {conversation_id}")
-            return conversation_id
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error when creating conversation: {e.response.status_code} - {e.response.text}")
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error creating conversation: {str(e)}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error creating conversation: {str(e)}")
-            raise
-    
-    def upload_file(self, file_path: str) -> Dict:
-        """
-        Upload a file and return the JSON response containing mediaId and URL.
-        Improved error handling and resource management.
-        """
-        # Save original content-type to restore later
-        original_content_type = self.session.headers.get("content-type")
-        
-        # Temporarily remove content-type header for multipart form upload
-        if "content-type" in self.session.headers:
-            del self.session.headers["content-type"]
-        
-        # Determine MIME type
-        content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
-        
+
+        response = await self._execute_with_retry(_make_request)
+
         try:
-            # Normalize file path
-            file_path = file_path.replace('\\', '/')
-            filename = file_path.split('/')[-1]
-            
-            # Track request for monitoring
-            self.last_request_time = time.time()
-            self.request_count += 1
-            
+            response_json = response.json()
+            conv_id = response_json.get("data", {}).get("create_grok_conversation", {}).get("conversation_id")
+            if not conv_id:
+                logger.error(f"Could not extract conversation_id from response: {response_json}")
+                raise ConnectionError("Failed to create Grok conversation: Invalid response format after retry.")
+            logger.info(f"New Grok conversation created: {conv_id} using credential #{self.current_cred_index + 1}")
+            return conv_id
+        except (json.JSONDecodeError, KeyError, AttributeError) as e:
+             logger.error(f"Error parsing successful conversation creation response: {e}")
+             raise ConnectionError(f"Failed to parse Grok conversation response after retry: {e}") from e
+
+
+    async def upload_file(self, file_path: str) -> List[dict]:
+        """
+        Upload a file asynchronously, handling retries on limiter errors. (Async)
+        """
+        original_content_type = self.session.headers.pop("content-type", None)
+
+        content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+        filename = os.path.basename(file_path)
+        logger.info(f"Attempting to upload file: {filename}")
+
+        try:
             with open(file_path, "rb") as f:
-                files = {
-                    "image": (
-                        filename,
-                        f,
-                        content_type
-                    )
-                }
-                
-                response = self.session.post(
-                    UPLOAD_FILE_URL, 
-                    files=files
+                file_content = f.read()
+
+            files = {
+                "image": (
+                    filename,
+                    file_content,
+                    content_type
                 )
-                
-                # Raise for HTTP errors
-                response.raise_for_status()
-                
+            }
+
+            async def _make_request():
+                 upload_headers = self.current_headers.copy()
+                 upload_headers.pop("content-type", None)
+                 return await asyncio.to_thread(
+                     self.session.post,
+                     UPLOAD_FILE_URL,
+                     files=files,
+                     headers=upload_headers,
+                     timeout=30
+                 )
+
+            response = await self._execute_with_retry(_make_request)
+
+            try:
                 response_json = response.json()
-                
-                if not response_json or not isinstance(response_json, list) or len(response_json) == 0:
-                    raise ValueError(f"Invalid response format when uploading file: {response_json}")
-                
-                media_id = response_json[0].get("mediaId")
-                if not media_id:
-                    raise ValueError(f"No mediaId in response: {response_json}")
-                    
-                # Add URL to response for convenience
-                response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
-                return response_json
-                
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error when uploading file: {e.response.status_code} - {e.response.text}")
-            raise
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error uploading file: {str(e)}")
-            raise
+                if isinstance(response_json, list) and response_json:
+                     media_id = response_json[0].get("mediaId")
+                     if media_id:
+                         response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
+                     logger.info(f"File {filename} uploaded successfully using credential #{self.current_cred_index + 1}")
+                     return response_json
+                else:
+                     logger.warning(f"Unexpected upload response format: {response_json}")
+                     return []
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                logger.error(f"Error parsing upload response for {filename}: {e}")
+                raise IOError(f"Failed to parse upload response after retry: {e}") from e
+
         except Exception as e:
-            logger.error(f"Error uploading file: {str(e)}")
-            raise
+            logger.error(f"Error during file upload preparation or execution for {filename}: {e}")
+            raise IOError(f"Error during file upload: {e}") from e
         finally:
-            # Always restore the content-type header
             if original_content_type:
                 self.session.headers["content-type"] = original_content_type
-    
-    def create_message(
-        self, 
-        model_name: str, 
-        imageGenerateCount: int = 1,
+                self.current_headers["content-type"] = original_content_type
+
+
+    def create_message_payload(
+        self,
+        model_name: str,
+        conversation_id: str,
+        imageGenerateCount: int = 0,
         returnSearchResults: bool = True,
         returnCitations: bool = True,
         eagerTweets: bool = True,
         serverHistory: bool = True,
         isDeepsearch: bool = False,
-        isReasoning: bool = False,
-        is_deeper_search: bool = False
-    ) -> Dict[str, Any]:
+        isReasoning: bool = False
+    ) -> dict:
         """
-        Create a template for the conversation payload using the specified Grok model.
+        Create a template for the conversation payload using the specified Grok model and conversation ID.
+        (No API call, no retry logic needed here)
         """
-        # Validate conversation ID exists
-        conversation_id = self.conversation_info.get("data", {}).get("create_grok_conversation", {}).get("conversation_id")
-        if not conversation_id:
-            raise ValueError("No active conversation. Call create_conversation() first.")
-        
-        # Create base payload with conversationId first
-        payload = {
+        if not isinstance(model_name, str) or not model_name.startswith("grok-"):
+             logger.warning(f"Potentially invalid model name '{model_name}'. Expected format 'grok-...'")
+
+        return {
             "responses": [],
             "systemPromptName": "",
             "grokModelOptionId": model_name,
             "conversationId": conversation_id,
-        }
-        
-        # Add deepsearchArgs if deeper search is enabled
-        if is_deeper_search:
-            payload["deepsearchArgs"] = {
-                "mode": "deeper"
-            }
-        
-        # Add remaining fields
-        payload.update({
             "returnSearchResults": returnSearchResults,
             "returnCitations": returnCitations,
             "promptMetadata": {
@@ -455,158 +437,163 @@ class Grok:
                 "eagerTweets": eagerTweets,
                 "serverHistory": serverHistory
             },
-            "enableSideBySide": not (isDeepsearch or is_deeper_search),
-            "toolOverrides": {},
             "isDeepsearch": isDeepsearch,
             "isReasoning": isReasoning
-        })
-        
-        return payload
+        }
 
-    def add_user_message(
+    def add_user_message_to_payload(
         self,
-        request_data: Dict[str, Any],
+        request_payload: dict,
         message: str,
         sender: int = 1,
-        file_attachments: Union[List, Dict] = []
+        file_attachments: Optional[List[dict]] = None
     ) -> None:
         """
-        Append a user message, optionally with file attachments, to the request payload.
+        Adds a single user message (potentially concatenated history) to the request payload.
+        (No API call, no retry logic needed here)
         """
-        # Make file_attachments an empty list if None
-        if file_attachments is None:
-            file_attachments = []
-            
-        # Convert dict to list if a single attachment was provided
-        if isinstance(file_attachments, dict):
-            file_attachments = [file_attachments]
-            
-        # Ensure request_data has responses key
-        if "responses" not in request_data:
-            request_data["responses"] = []
-            
-        request_data["responses"].append({
+        request_payload["responses"] = [{
             "message": message,
             "sender": sender,
-            "promptSource": "",
-            "fileAttachments": file_attachments
-        })
-    
-    def send(self, request_data: Dict[str, Any], retry_on_error: bool = False) -> str:
+            "fileAttachments": file_attachments if file_attachments else []
+        }]
+
+    async def send(self, request_payload: dict) -> str:
         """
-        Send the conversation payload to the server and return the response text.
-        Modified to remove retry logic.
+        Send the conversation payload (NON-STREAMING), handling retries on limiter errors.
+        Returns the full response text.
         """
-        try:
-            # Track request for monitoring
-            self.last_request_time = time.time()
-            self.request_count += 1
-            
-            response = self.session.post(
-                ADD_RESPONSE_URL, 
-                json=request_data
+        logger.info("Attempting to send non-streaming message...")
+
+        async def _make_request():
+            return await asyncio.to_thread(
+                self.session.post,
+                ADD_RESPONSE_URL,
+                json=request_payload,
+                timeout=180
             )
-            
-            # Check for HTTP errors
-            response.raise_for_status()
-            return response.text
-            
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error sending message: {e.response.status_code} - {e.response.text}")
-            raise
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error: {str(e)}")
-            raise
-    
-    def _is_rate_limit_response(self, result_data: Dict[str, Any]) -> bool:
-        """Check if the result_data indicates a rate limit."""
-        # Quick check with multiple conditions to determine rate limiting
-        if result_data.get("responseType") == "limiter" or "upsell" in result_data:
-            return True
-        
-        # Check message content for rate limit text
-        message = result_data.get("message", "")
-        if message and ("You've reached your limit" in message or "limit of" in message):
-            return True
-        
-        return False
-    
-    def send_streaming(self, request_data: Dict[str, Any], filter_final_only: bool = False) -> Generator:
+
+        response = await self._execute_with_retry(_make_request)
+
+        logger.info(f"Non-streaming message sent successfully using credential #{self.current_cred_index + 1}")
+        return response.text
+
+
+    async def send_stream(self, request_payload: dict) -> AsyncGenerator[str, None]:
         """
-        Send the conversation payload to the server and yield message tokens as they arrive.
-        This allows for real-time streaming of Grok's responses.
-        
-        Args:
-            request_data: The request payload to send
-            filter_final_only: If True, only yield messages with messageTag="final"
+        Send the conversation payload and stream the response line by line asynchronously using aiohttp.
+        Handles credential rotation on limiter errors detected *at the start* of the stream.
+        Yields raw JSON lines (as strings with newline) from the response.
         """
-        try:
-            # Track request for monitoring
-            self.last_request_time = time.time()
-            self.request_count += 1
-            
-            with self.session.post(
-                ADD_RESPONSE_URL, 
-                json=request_data, 
-                stream=True
-            ) as response:
-                # Check for HTTP errors
-                response.raise_for_status()
-                
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                        
-                    line_text = line.decode('utf-8')
-                    try:
-                        # Only try to parse JSON if it looks like JSON
-                        if line_text.strip().startswith("{"):
-                            parsed = json.loads(line_text)
-                            result_data = parsed.get("result", {})
-                            
-                            # Check if this is a rate limit response BEFORE filtering
-                            if self._is_rate_limit_response(result_data):
-                                # Yield a special token to indicate rate limiting
-                                yield "__RATE_LIMITED__"
-                                return
-                            
-                            message_token = result_data.get("message")
-                            message_tag = result_data.get("messageTag")
-                            
-                            # Skip entries with messageTag set to "thinking_trace"
-                            if message_tag == "thinking_trace":
+        initial_cred_index = self.current_cred_index
+        attempt_count = 0
+        timeout = aiohttp.ClientTimeout(total=180)
+
+        while attempt_count < self.num_credentials:
+            current_index_for_attempt = self.current_cred_index
+            logger.info(f"Attempting stream request {attempt_count + 1}/{self.num_credentials} using credential #{current_index_for_attempt + 1}")
+
+            try:
+                async with aiohttp.ClientSession(headers=self.current_headers, timeout=timeout) as session:
+                     async with session.post(ADD_RESPONSE_URL, json=request_payload) as response:
+                        if not response.ok:
+                            error_text = await response.text()
+                            logger.warning(f"Stream request failed with HTTP {response.status} for credential #{current_index_for_attempt + 1}. Body: {error_text[:500]}")
+                            is_limiter_http = False
+                            if response.status == 429:
+                                is_limiter_http = True
+                            else:
+                                try:
+                                    error_json = json.loads(error_text)
+                                    if error_json.get("result", {}).get("responseType") == "limiter":
+                                        is_limiter_http = True
+                                except json.JSONDecodeError:
+                                    pass
+
+                            if is_limiter_http:
+                                wrapped = self._get_next_credentials()
+                                attempt_count += 1
+                                if wrapped and attempt_count >= self.num_credentials:
+                                    raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP error during stream attempt).")
+                                await asyncio.sleep(1)
                                 continue
-                                
-                            # Check if this is potentially a thinking trace (additional check)
-                            if result_data.get("isThinking") is True:
+                            else:
+                                response.raise_for_status()
+
+
+                        buffer = ""
+                        first_line_checked = False
+                        async for chunk in response.content.iter_any():
+                            if not chunk:
                                 continue
-                            
-                            # Check if we should filter for final messages
-                            if message_token:
-                                # For deepsearch responses, only include chunks tagged as "final"
-                                if filter_final_only:
-                                    if message_tag == "final":
-                                        yield message_token
-                                else:
-                                    yield message_token
-                        else:
-                            # Non-JSON line, yield it directly unless filtering
-                            if not filter_final_only:
-                                yield line_text
-                                
-                    except json.JSONDecodeError:
-                        # Skip malformed JSON
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error processing streaming response: {str(e)}")
-                        
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error during streaming: {e.response.status_code} - {e.response.text}")
-            yield f"__ERROR__: HTTP {e.response.status_code}"
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error during streaming: {str(e)}")
-            yield f"__ERROR__: {str(e)}"
-        except Exception as e:
-            logger.error(f"Unexpected error during streaming: {str(e)}")
-            yield f"__ERROR__: {str(e)}"
+                            try:
+                                buffer += chunk.decode('utf-8', errors='ignore')
+                            except UnicodeDecodeError as ude:
+                                logger.warning(f"Unicode decode error in chunk: {ude}. Skipping problematic part.")
+                                continue
+
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.strip()
+                                if not line:
+                                    continue
+
+                                if not first_line_checked:
+                                    first_line_checked = True
+                                    try:
+                                        parsed_first = json.loads(line)
+                                        if parsed_first.get("result", {}).get("responseType") == "limiter":
+                                            logger.warning(f"Limiter detected in first stream chunk for credential #{current_index_for_attempt + 1}. Switching.")
+                                            raise StopAsyncIteration("limiter")
+                                    except json.JSONDecodeError:
+                                        pass
+                                    except Exception as e:
+                                        logger.error(f"Error checking first stream line for limiter: {e}")
+
+                                yield line + "\n"
+
+                        if buffer.strip():
+                             if not first_line_checked:
+                                 try:
+                                     parsed_final = json.loads(buffer.strip())
+                                     if parsed_final.get("result", {}).get("responseType") == "limiter":
+                                         logger.warning(f"Limiter detected in final stream buffer for credential #{current_index_for_attempt + 1}. Switching.")
+                                         raise StopAsyncIteration("limiter")
+                                 except json.JSONDecodeError: pass
+                                 except Exception as e: logger.error(f"Error checking final buffer for limiter: {e}")
+
+                             yield buffer.strip() + "\n"
+
+                        logger.info(f"Stream completed successfully using credential #{self.current_cred_index + 1}")
+                        return
+
+            except StopAsyncIteration as sai:
+                if str(sai) == "limiter":
+                    wrapped = self._get_next_credentials()
+                    attempt_count += 1
+                    if wrapped and attempt_count >= self.num_credentials:
+                        raise AllCredentialsLimitedError("All credentials hit the rate limiter during streaming.")
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    raise
+
+            except aiohttp.ClientResponseError as e:
+                logger.error(f"Stream request failed (aiohttp {e.status}) for credential #{current_index_for_attempt + 1}: {e.message}")
+                raise ConnectionError(f"Stream failed (HTTP {e.status}): {e.message}") from e
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Stream connection error for credential #{current_index_for_attempt + 1}: {e}")
+                raise ConnectionError(f"Stream connection failed: {e}") from e
+
+            except asyncio.TimeoutError:
+                 logger.error(f"Stream request timed out for credential #{current_index_for_attempt + 1} after {timeout.total} seconds.")
+                 raise ConnectionError("Request timed out while streaming Grok response.") from asyncio.TimeoutError
+
+            except Exception as e:
+                logger.error(f"Unexpected error during streaming with credential #{current_index_for_attempt + 1}: {e.__class__.__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                raise ConnectionError(f"Unexpected streaming error: {e}") from e
+
+        raise AllCredentialsLimitedError("Failed to get a successful stream after trying all credentials.")

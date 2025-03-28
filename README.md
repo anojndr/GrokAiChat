@@ -1,318 +1,341 @@
-# GrokAiChat
+# Grok OpenAI-Compatible API
 
-A Python library for interacting with Grok AI through X's user account API. This project provides both a clean interface for direct Grok API interactions and an OpenAI-compatible API server. Note: This uses the account user API, not the paid enterprise API. Grok AI is free for all X (Twitter) members.
+An asynchronous Python library and FastAPI server for interacting with Grok AI using X's user account API. This project provides an OpenAI-compatible `/v1/chat/completions` endpoint, enabling integration with existing tools, along with features like automatic credential rotation to handle rate limits.
+
+**Note:** This uses the unofficial X user account API, not the paid enterprise API. Grok AI access is required (currently available to X Premium subscribers).
 
 ## Features
 
-- 🤖 Full Grok API integration
-- 📁 File upload support
-- 💬 Conversation management
-- 🛠️ Easy-to-use interface
-- 🔄 OpenAI-compatible API (use with existing OpenAI clients)
-- 🐳 Docker support for easy deployment
-- 🔍 Support for Grok DeepSearch and Reasoning modes
-- 🧠 Support for enhanced "deeper" search mode
-- 🔄 Credential rotation for higher throughput
-- 📊 Streaming responses
+-   🚀 **OpenAI-Compatible API:** Run a local server (`main.py`) that mimics the OpenAI `/v1/chat/completions` endpoint for Grok.
+-   🔄 **Credential Rotation:** Automatically cycles through multiple X account credentials (`.env` configured) to mitigate rate limits.
+-   ⚡ **Asynchronous:** Built with `asyncio`, `aiohttp`, and `FastAPI` for efficient non-blocking operations.
+-   📄 **Streaming Support:** Handles OpenAI-style Server-Sent Events (SSE) for streaming responses.
+-   🖼️ **Image Support:** Send images (via URL or base64 data URI) in chat messages, compatible with the OpenAI vision format.
+-   🤖 **Grok Integration:** Leverages the underlying `grok.py` library for core interactions.
+-   ⚙️ **Configurable:** Easily configure multiple accounts via `.env`.
+-   🔍 **Special Modes:** Activate `deepsearch` or `reasoning` modes by including keywords in your prompt.
 
 ## Prerequisites
 
-- Python 3.8 or higher
-- A valid X (formerly Twitter) account
-- Grok AI access (free for all X members)
-- Your account's authentication tokens
+-   Python 3.8 or higher
+-   One or more valid X (formerly Twitter) accounts with **X Premium** (for Grok access).
+-   Authentication tokens (Cookies, CSRF Token, Bearer Token) for **each** account you want to use for rotation.
 
 ## Installation
 
-1. Clone the repository:
+1.  Clone the repository:
     ```sh
     git clone https://github.com/vibheksoni/GrokAiChat.git
-    cd GrokAiChat
+    cd grok_ai_chat
     ```
+    *(Note: If your local directory name differs, use that name instead of `grok_ai_chat`)*
 
-2. Install dependencies:
+2.  Install dependencies:
     ```sh
     pip install -r requirements.txt
     ```
+    *(This installs `fastapi`, `uvicorn`, `requests`, `python-dotenv`, `aiohttp`, `aiofiles`, etc.)*
 
-## Configuration
+## Configuration: Multiple Accounts for Rotation
 
-1. Create a `.env` file in the project root:
+To enable credential rotation and mitigate rate limits, you need to provide credentials for **multiple** X accounts.
+
+1.  Create a `.env` file in the project root (`grok_ai_chat/`).
+
+2.  Add credentials for each account using numbered suffixes (up to 5 are checked by default in `main.py`, but you can add more):
+
     ```dotenv
-    # Raw cookies string
-    # Example: "cookie1=value1; cookie2=value2"
-    COOKIES=""
-    # CSRF token
-    X_CSRF_TOKEN=""
-    # Bearer token
-    BEARER_TOKEN=""
-    
-    # Optional: Multiple credential sets (for API server)
-    COOKIES_2=""
-    X_CSRF_TOKEN_2=""
-    BEARER_TOKEN_2=""
-    
-    # API settings
-    PORT=5000
-    API_CONNECT_TIMEOUT=10.0
-    API_READ_TIMEOUT=30.0
-    DOWNLOAD_CONNECT_TIMEOUT=5.0
-    DOWNLOAD_READ_TIMEOUT=10.0
-    MAX_RETRIES=3
-    GROK_RETRY_COUNT=2
-    GROK_RETRY_BACKOFF=1.5
-    STREAM_BUFFER_SIZE=10
+    # Account 1
+    COOKIES_1="your_account_1_cookie_string"
+    X_CSRF_TOKEN_1="your_account_1_csrf_token"
+    BEARER_TOKEN_1="your_account_1_bearer_token"
+
+    # Account 2 (Optional, but recommended for rotation)
+    COOKIES_2="your_account_2_cookie_string"
+    X_CSRF_TOKEN_2="your_account_2_csrf_token"
+    BEARER_TOKEN_2="your_account_2_bearer_token"
+
+    # Account 3 (Optional)
+    COOKIES_3="your_account_3_cookie_string"
+    X_CSRF_TOKEN_3="your_account_3_csrf_token"
+    BEARER_TOKEN_3="your_account_3_bearer_token"
+
+    # ... add more accounts as needed (COOKIES_4, etc.)
+
+    # Optional: Server configuration
+    # HOST=0.0.0.0
+    # PORT=5000
     ```
 
-2. To obtain your tokens:
-    - Log into X.com
-    - Open Developer Tools (F12)
-    - Create a Grok chat
-    - Find the tokens in the Network tab request headers
+### How to Get Your Credentials (For Each Account)
 
-## Account Requirements & Credentials
+1.  **Log into X.com** with the desired account.
+2.  Open your browser's **Developer Tools** (usually F12).
+3.  Navigate to the **Network** tab.
+4.  Go to the Grok chat interface on X.com (e.g., `https://x.com/i/grok`).
+5.  Send a message in the Grok chat.
+6.  Find requests made to `x.com` or `api.x.com` in the Network tab. Look for requests like `CreateGrokConversation` or `add_response.json`.
+7.  **Inspect Headers:**
+    *   **Cookies**: Find the `cookie` request header. Copy the **entire** long string value.
+    *   **X-CSRF-Token**: Find the `x-csrf-token` request header. Copy its value (usually a 32-character alphanumeric string).
+    *   **Bearer Token**: Find the `authorization` request header. Copy the token part after `Bearer ` (it usually starts with `AAAA...`).
+8.  Paste these values into your `.env` file for the corresponding account number (`_1`, `_2`, etc.).
 
-⚠️ **IMPORTANT**: You need:
-1. A standard X account (Grok AI is free for all X members)
-2. The following credentials from your account:
+## Running the API Server
 
-### How to Get Your Credentials
+Once configured, run the FastAPI server:
 
-1. **Cookies**:
-   - Log into X.com
-   - Open Developer Tools (F12) → Network tab
-   - Interact with Grok
-   - Find any request to x.com
-   - Copy the entire `cookie` header value
-
-2. **X-CSRF-Token**:
-   - In the same Network tab
-   - Look for `x-csrf-token` in request headers
-   - It's usually a 32-character string
-
-3. **Bearer Token**:
-   - Find any request header containing `authorization`
-   - Copy the token after "Bearer "
-   - Usually starts with "AAAA..."
-
-Store these in your `.env` file as shown above. For the API server, you can add multiple credential sets (COOKIES_2, X_CSRF_TOKEN_2, etc.) for automatic rotation when rate limits are hit.
-
-## Usage Options
-
-### Option 1: Direct Library Usage
-
-```python
-from grok import Grok, GrokMessages
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-grok = Grok(
-    os.getenv("BEARER_TOKEN"),
-    os.getenv("X_CSRF_TOKEN"),
-    os.getenv("COOKIES"),
-    timeout=(10.0, 30.0)  # (connect_timeout, read_timeout)
-)
-
-# Create a conversation
-grok.create_conversation()
-
-# Send a message
-request = grok.create_message("grok-3")
-grok.add_user_message(request, "Hello, Grok!")
-response = grok.send(request)
-
-# Parse and print response
-messages = GrokMessages(response)
-print(messages.get_full_message())
-```
-
-### Option 2: OpenAI-Compatible API Server
-
-#### Starting the Server
-
-**Using Python:**
 ```sh
-uvicorn app:app --host 0.0.0.0 --port 5000 --workers 4
+uvicorn main:app --reload --host 0.0.0.0 --port 5000
 ```
 
-**Using Docker:**
+-   `--reload`: Automatically restarts the server when code changes (useful for development).
+-   `--host 0.0.0.0`: Makes the server accessible from other devices on your network.
+-   `--port 5000`: Specifies the port (can be changed, ensure it matches `.env` if set).
+
+The API will be available at `http://localhost:5000` (or the host/port you configured).
+
+## Using the OpenAI-Compatible API
+
+You can now use any OpenAI-compatible client library or tool (like `curl`, Python `openai` library, UI clients) to interact with your local Grok API server.
+
+**API Endpoint:** `http://localhost:5000/v1/chat/completions`
+**Model Name:** `grok-3` (This is the only model ID currently supported by the adapter)
+
+### Example: `curl` Request (Text)
+
 ```sh
-docker-compose up -d
-```
-
-#### Using the API with OpenAI Client
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    api_key="dummy-key",  # Not actually used, but required
-    base_url="http://localhost:5000/v1"  # Your GrokAI API server address
-)
-
-# Create a simple chat completion
-response = client.chat.completions.create(
-    model="grok-3",  # You can also use OpenAI model names like "gpt-4"
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant powered by Grok AI."},
-        {"role": "user", "content": "Tell me about yourself. What AI model are you?"}
-    ]
-)
-
-# Print the response
-print(f"Response: {response.choices[0].message.content}")
-```
-
-#### Direct API Calls
-
-```python
-import requests
-
-endpoint = "http://localhost:5000/v1/chat/completions"
-
-payload = {
+curl http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
     "model": "grok-3",
     "messages": [
-        {"role": "system", "content": "You are a helpful assistant powered by Grok AI."},
-        {"role": "user", "content": "Explain what makes you unique as an AI."}
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Explain the concept of asynchronous programming in Python."}
     ],
-    "stream": False
-}
-
-response = requests.post(endpoint, json=payload)
-
-if response.status_code == 200:
-    data = response.json()
-    print(f"Response: {data['choices'][0]['message']['content']}")
-else:
-    print(f"Error: {response.status_code}, {response.text}")
+    "stream": false
+  }'
 ```
 
-#### Special Features
+### Example: `curl` Request (Streaming)
 
-**DeepSearch Mode:**
+```sh
+curl http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-3",
+    "messages": [
+      {"role": "user", "content": "Write a short poem about the moon."}
+    ],
+    "stream": true
+  }'
+```
+
+### Example: `curl` Request (Image URL)
+
+```sh
+curl http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-3",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "What is in this image?"},
+          {"type": "image_url", "image_url": {"url": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat_paw.jpg/800px-Cat_paw.jpg"}}
+        ]
+      }
+    ],
+    "stream": false
+  }'
+```
+
+### Example: Python `openai` Client
+
 ```python
-# Add the "deepsearch" keyword to your prompt to enable Grok's DeepSearch
-response = client.chat.completions.create(
-    model="grok-3",
-    messages=[
-        {"role": "user", "content": "deepsearch What are the latest developments in quantum computing?"}
-    ]
+import openai
+
+# Point the client to your local server
+client = openai.OpenAI(
+    base_url="http://localhost:5000/v1",
+    api_key="not-needed" # API key is not required by this server
 )
+
+try:
+    completion = client.chat.completions.create(
+        model="grok-3",
+        messages=[
+            {"role": "system", "content": "You are Grok."},
+            {"role": "user", "content": "Tell me a fun fact about space."}
+        ],
+        stream=False # Set to True for streaming
+    )
+    print(completion.choices[0].message.content)
+
+except openai.APIConnectionError as e:
+    print(f"Failed to connect to the server: {e}")
+except openai.APIStatusError as e:
+    print(f"API Error: Status {e.status_code}, Response: {e.response}")
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+
+# Example with image URL
+try:
+    completion_with_image = client.chat.completions.create(
+      model="grok-3",
+      messages=[
+        {
+          "role": "user",
+          "content": [
+            {"type": "text", "text": "Describe the main object in this image."},
+            {"type": "image_url", "image_url": {"url": "https://www.example.com/image.jpg"}}, # Replace with actual URL
+          ],
+        }
+      ]
+    )
+    print(completion_with_image.choices[0].message.content)
+except Exception as e:
+    print(f"An error occurred with image request: {e}")
+
 ```
 
-**Deeper Search Mode:**
+## Using the `Grok` Library Directly (Advanced)
+
+While the primary interface is the API server, you can still use the underlying asynchronous `Grok` library directly in your Python code.
+
 ```python
-# Add the "deepersearch" keyword to your prompt to enable Grok's enhanced deeper search mode
-response = client.chat.completions.create(
-    model="grok-3",
-    messages=[
-        {"role": "user", "content": "deepersearch Tell me about the most complex semiconductor manufacturing processes"}
-    ]
-)
+import asyncio
+import os
+from dotenv import load_dotenv
+from grok import Grok, GrokMessages, AllCredentialsLimitedError
+
+async def main():
+    load_dotenv()
+
+    # Load credentials into the required list format
+    credential_sets = []
+    for i in range(1, 6): # Check for up to 5 accounts
+        cookie = os.getenv(f"COOKIES_{i}")
+        csrf_token = os.getenv(f"X_CSRF_TOKEN_{i}")
+        bearer_token = os.getenv(f"BEARER_TOKEN_{i}")
+        if all([cookie, csrf_token, bearer_token]):
+            credential_sets.append({
+                "cookies": cookie,
+                "csrf": csrf_token,
+                "bearer": bearer_token
+            })
+
+    if not credential_sets:
+        print("Error: No complete credential sets found in .env")
+        return
+
+    try:
+        grok_client = Grok(credential_sets=credential_sets)
+
+        # 1. Create a conversation
+        print("Creating conversation...")
+        conversation_id = await grok_client.create_new_conversation()
+        print(f"Conversation ID: {conversation_id}")
+
+        # 2. Prepare message payload
+        payload = grok_client.create_message_payload(
+            model_name="grok-3", # Use the appropriate model ID
+            conversation_id=conversation_id
+        )
+
+        # 3. Add user message
+        grok_client.add_user_message_to_payload(
+            request_payload=payload,
+            message="Hello Grok! Write a haiku about code."
+            # file_attachments=... # Optional: Use upload_file first
+        )
+
+        # 4. Send (non-streaming)
+        print("Sending message...")
+        response_text = await grok_client.send(payload)
+
+        # 5. Parse and print response
+        messages = GrokMessages(response_text)
+        print("\nFull Response:")
+        print(messages.get_full_message())
+
+        # --- Example: Streaming ---
+        print("\n--- Streaming Example ---")
+        payload_stream = grok_client.create_message_payload("grok-3", conversation_id)
+        grok_client.add_user_message_to_payload(payload_stream, "Tell me another short poem.")
+
+        async for line in grok_client.send_stream(payload_stream):
+            try:
+                parsed = GrokMessages(line) # Parse each line individually
+                token = parsed.get_full_message()
+                if token:
+                    print(token, end='', flush=True)
+            except Exception: # Handle potential JSON errors on partial lines if needed
+                pass
+        print("\n--- Stream End ---")
+
+
+    except AllCredentialsLimitedError:
+        print("Error: All provided credentials hit the rate limit.")
+    except (ConnectionError, IOError) as e:
+        print(f"Error communicating with Grok: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-**Reasoning Mode:**
-```python
-# Add the "reasoning" keyword to your prompt to enable Grok's reasoning mode
-response = client.chat.completions.create(
-    model="grok-3",
-    messages=[
-        {"role": "user", "content": "reasoning Solve this complex problem step by step..."}
-    ]
-)
-```
+## ⚠️ Important Legal Warnings & Rate Limiting
 
-## Docker Deployment
+1.  **Terms of Service**: Using this tool **may violate** X's Terms of Service regarding automated access and API usage. **Use entirely at your own risk.** The author assumes no responsibility for account restrictions or bans.
+2.  **Account Security**:
+    *   Never share your `.env` file or credentials publicly.
+    *   The credential rotation helps, but excessive requests can still lead to temporary or permanent limitations on your accounts. Use responsibly.
+3.  **Compliance**:
+    *   This tool is intended for personal, experimental, and educational purposes.
+    *   Commercial use is strongly discouraged and likely violates X's terms.
+    *   You are solely responsible for ensuring your use complies with all applicable laws and X's policies.
+4.  **Rate Limiting Mitigation**:
+    *   The credential rotation significantly helps bypass individual account rate limits.
+    *   However, X might implement broader IP-based or behavior-based limits.
+    *   Avoid extremely high request volumes. Add delays in client applications if needed.
 
-1. Build and start the container:
-   ```sh
-   docker-compose up -d
-   ```
+## API Documentation (`grok.py`)
 
-2. View logs:
-   ```sh
-   docker-compose logs -f
-   ```
+-   `Grok(credential_sets: List[Dict[str, str]])`: Initializes the client with multiple account credentials. Handles rotation.
+    -   `create_new_conversation()`: Starts a new chat session (async).
+    -   `upload_file(file_path: str)`: Uploads a local file (async).
+    -   `create_message_payload(...)`: Creates the JSON structure for sending a message.
+    -   `add_user_message_to_payload(...)`: Adds the user's text and attachments to the payload.
+    *   `send(payload: dict)`: Sends the message and returns the full response text (async).
+    *   `send_stream(payload: dict)`: Sends the message and yields response lines asynchronously (async generator).
+-   `GrokMessages(raw_data: str)`: Parses the raw JSONL response string from Grok.
+    -   `get_full_message()`: Returns the concatenated message content.
+    -   `is_limiter_response()`: Checks if the response indicates a rate limit.
+    -   Other methods to extract specific parts of the response (web results, suggestions, etc.).
+-   `AllCredentialsLimitedError`: Exception raised when all accounts in the rotation hit a rate limit.
 
-3. Stop the service:
-   ```sh
-   docker-compose down
-   ```
-
-### Environment Variables for Docker
-
-You can configure the Docker deployment by modifying the `.env` file or setting environment variables. Key settings include:
-
-- `PORT`: Server port (default: 5000)
-- `WORKERS`: Number of Uvicorn workers (default: 4)
-- `API_CONNECT_TIMEOUT`, `API_READ_TIMEOUT`: Request timeouts
-- `MEMORY_LIMIT`, `CPU_LIMIT`: Resource limits for the container
-
-## Advanced Usage
-
-Check the `examples/` directory for more advanced use cases:
-- Basic chat interaction (`chat.py`)
-- File attachments (`chatwithfiles.py`)
-- OpenAI-compatible API usage (`example_usage.py`)
-
-## API Documentation
-
-### Main Classes
-
-- `Grok`: Main interface for API interactions
-- `GrokMessages`: Response parser and message handler
-
-### API Endpoints
-
-- `GET /v1/models`: List available models
-- `POST /v1/chat/completions`: Create a chat completion (OpenAI-compatible)
-- `GET /`: API status and information
-
-### Search Modes
-
-- **Regular**: Standard Grok behavior with no special flags
-- **DeepSearch**: Add "deepsearch" keyword to prompt for enhanced web search capabilities
-- **DeeperSearch**: Add "deepersearch" keyword for more intensive web research with the deeper search mode
-- **Reasoning**: Add "reasoning" keyword for step-by-step reasoning approach
-
-Full documentation is available in the code comments.
-
-## ⚠️ Important Legal Warnings
-
-1. **Terms of Service**: This project **may violate** X's Terms of Service. Use at your own risk.
-
-2. **Account Security**: 
-   - Never share your credentials
-   - Avoid excessive requests
-   - Use reasonable rate limits
-
-3. **Compliance**:
-   - This tool is for educational purposes only
-   - Commercial use may violate X's terms
-   - You are responsible for how you use this code
+Full details are available in the code comments within `grok.py`.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
-
-## Legal Notice
-
-⚠️ **Disclaimer**: This project is for educational purposes only. Users are responsible for ensuring their usage complies with X's terms of service.
+1.  Fork the repository.
+2.  Create a feature branch (`git checkout -b feature/AmazingFeature`).
+3.  Commit your changes (`git commit -m 'Add some AmazingFeature'`).
+4.  Push to the branch (`git push origin feature/AmazingFeature`).
+5.  Open a Pull Request.
 
 ## License
 
-[MIT License](LICENSE) - See license file for details.
+Distributed under the MIT License. See `LICENSE` file for details.
 
 ## Author
 
 **Vibhek Soni**
-- Age: 19
 - GitHub: [@vibheksoni](https://github.com/vibheksoni)
-- Project Link: [GrokAiChat](https://github.com/vibheksoni/GrokAiChat)
+- Project Link: [https://github.com/vibheksoni/GrokAiChat](https://github.com/vibheksoni/GrokAiChat)
 
 **anojndr**
 - GitHub: [@anojndr](https://github.com/anojndr)
