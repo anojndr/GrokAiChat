@@ -217,7 +217,7 @@ class Grok:
         }
         self.session.headers.clear()
         self.session.headers.update(headers)
-        self.current_headers = headers.copy()
+        self.current_headers = headers
 
     async def _execute_with_retry(self, func, *args, **kwargs):
         """
@@ -233,46 +233,15 @@ class Grok:
             current_index_for_attempt = self.current_cred_index
             logger.debug(f"Attempt {attempt_count + 1}/{self.num_credentials} using credential #{current_index_for_attempt + 1}")
             try:
-                self._update_headers()
-
                 response = await func(*args, **kwargs)
+
 
                 response_text = ""
                 is_limiter = False
 
                 if isinstance(response, requests.Response):
+                    response.raise_for_status()
                     response_text = response.text
-                    try:
-                        response.raise_for_status()
-                    except requests.exceptions.RequestException as http_error:
-                        is_limiter_http = False
-                        if response.status_code == 429:
-                            is_limiter_http = True
-                            logger.warning(f"HTTP 429 (Too Many Requests) received for credential #{current_index_for_attempt + 1}.")
-                        else:
-                            try:
-                                error_json = response.json()
-                                if error_json.get("result", {}).get("responseType") == "limiter":
-                                    is_limiter_http = True
-                                    logger.warning(f"Limiter JSON found in error response body for credential #{current_index_for_attempt + 1}.")
-                                elif "data" in error_json and "create_grok_conversation" in error_json["data"] and \
-                                     error_json["data"]["create_grok_conversation"] is None and "errors" in error_json:
-                                     if any("rate limit" in err.get("message","").lower() for err in error_json.get("errors",[])):
-                                         is_limiter_http = True
-                                         logger.warning("Detected potential rate limit from GraphQL errors in error response.")
-
-                            except (json.JSONDecodeError, AttributeError):
-                                pass
-
-                        if is_limiter_http:
-                            wrapped = self._get_next_credentials()
-                            attempt_count += 1
-                            if wrapped and attempt_count >= self.num_credentials:
-                                raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP error or error body).")
-                            continue
-
-                        raise ConnectionError(f"Request failed: {http_error}") from http_error
-
                     try:
                         parsed_data = json.loads(response_text)
                         if isinstance(parsed_data, list):
@@ -286,36 +255,54 @@ class Grok:
                              parsed_data["data"]["create_grok_conversation"] is None and "errors" in parsed_data:
                              if any("rate limit" in err.get("message","").lower() for err in parsed_data.get("errors",[])):
                                  is_limiter = True
-                                 logger.warning("Detected potential rate limit from GraphQL errors in successful response.")
+                                 logger.warning("Detected potential rate limit from GraphQL errors.")
 
                     except json.JSONDecodeError:
                         pass
                     except Exception as e:
-                        logger.error(f"Error checking non-streaming response body for limiter: {e}")
-
+                        logger.error(f"Error checking non-streaming response for limiter: {e}")
 
 
                 if is_limiter:
-                    logger.warning(f"Limiter detected in response body for credential #{current_index_for_attempt + 1}. Switching credentials.")
+                    logger.warning(f"Limiter detected for credential #{current_index_for_attempt + 1}. Switching credentials.")
                     wrapped = self._get_next_credentials()
                     attempt_count += 1
                     if wrapped and attempt_count >= self.num_credentials:
-                        raise AllCredentialsLimitedError("All credentials hit the rate limiter (response body).")
+                        raise AllCredentialsLimitedError("All credentials hit the rate limiter.")
+                    await asyncio.sleep(1)
                     continue
 
                 return response
 
-            except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as e:
-                logger.error(f"Network/Connection error for credential #{current_index_for_attempt + 1}: {e.__class__.__name__}: {e}")
-                wrapped = self._get_next_credentials()
-                attempt_count += 1
-                if wrapped and attempt_count >= self.num_credentials:
-                    raise AllCredentialsLimitedError(f"Failed after trying all credentials due to connection errors. Last error: {e}") from e
-                continue
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request failed for credential #{current_index_for_attempt + 1}: {e}")
+                is_limiter_http = False
+                if e.response is not None:
+                    if e.response.status_code == 429:
+                        is_limiter_http = True
+                        logger.warning(f"HTTP 429 (Too Many Requests) received for credential #{current_index_for_attempt + 1}.")
+                    else:
+                        try:
+                            error_json = e.response.json()
+                            if error_json.get("result", {}).get("responseType") == "limiter":
+                                is_limiter_http = True
+                                logger.warning(f"Limiter JSON found in error response body for credential #{current_index_for_attempt + 1}.")
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+                if is_limiter_http:
+                    wrapped = self._get_next_credentials()
+                    attempt_count += 1
+                    if wrapped and attempt_count >= self.num_credentials:
+                        raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP 429 or error body).")
+                    await asyncio.sleep(1)
+                    continue
+
+                raise ConnectionError(f"Request failed: {e}") from e
 
             except (json.JSONDecodeError, KeyError, AttributeError, IndexError) as e:
-                 logger.error(f"Error processing successful response for credential #{current_index_for_attempt + 1}: {e}")
-                 raise ConnectionError(f"Failed to process expected response format: {e}") from e
+                 logger.error(f"Error processing response for credential #{current_index_for_attempt + 1}: {e}")
+                 raise ConnectionError(f"Failed to process response: {e}") from e
 
             except Exception as e:
                 logger.error(f"Unexpected error during request with credential #{current_index_for_attempt + 1}: {e.__class__.__name__}: {e}")
@@ -347,11 +334,8 @@ class Grok:
             response_json = response.json()
             conv_id = response_json.get("data", {}).get("create_grok_conversation", {}).get("conversation_id")
             if not conv_id:
-                logger.error(f"Could not extract conversation_id. Response: {response_json}")
-                if "errors" in response_json and any("rate limit" in err.get("message","").lower() for err in response_json.get("errors",[])):
-                     logger.error("Rate limit error detected in GraphQL response after _execute_with_retry completed.")
-                     raise AllCredentialsLimitedError("Rate limit detected late in create_new_conversation response.")
-                raise ConnectionError("Failed to create Grok conversation: Invalid response format (missing conversation_id).")
+                logger.error(f"Could not extract conversation_id from response: {response_json}")
+                raise ConnectionError("Failed to create Grok conversation: Invalid response format after retry.")
             logger.info(f"New Grok conversation created: {conv_id} using credential #{self.current_cred_index + 1}")
             return conv_id
         except (json.JSONDecodeError, KeyError, AttributeError) as e:
@@ -363,14 +347,11 @@ class Grok:
         """
         Upload a file asynchronously, handling retries on limiter errors. (Async)
         """
-        original_content_type = self.current_headers.get("content-type")
+        original_content_type = self.session.headers.pop("content-type", None)
 
         content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
         filename = os.path.basename(file_path)
         logger.info(f"Attempting to upload file: {filename}")
-
-        temp_headers = self.current_headers.copy()
-        temp_headers.pop("content-type", None)
 
         try:
             with open(file_path, "rb") as f:
@@ -385,15 +366,13 @@ class Grok:
             }
 
             async def _make_request():
-                 current_attempt_headers = self.current_headers.copy()
-                 current_attempt_headers.pop("content-type", None)
-
+                 upload_headers = self.current_headers.copy()
+                 upload_headers.pop("content-type", None)
                  return await asyncio.to_thread(
-                     requests.post,
+                     self.session.post,
                      UPLOAD_FILE_URL,
                      files=files,
-                     headers=current_attempt_headers,
-                     cookies=self.session.cookies,
+                     headers=upload_headers,
                      timeout=30
                  )
 
@@ -402,40 +381,25 @@ class Grok:
             try:
                 response_json = response.json()
                 if isinstance(response_json, list) and response_json:
-                     media_info = response_json[0]
-                     media_id = media_info.get("mediaId")
+                     media_id = response_json[0].get("mediaId")
                      if media_id:
-                         media_info["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
-                         logger.info(f"File {filename} uploaded successfully using credential #{self.current_cred_index + 1}. Media ID: {media_id}")
-                         return response_json
-                     else:
-                         logger.warning(f"Upload response missing 'mediaId': {response_json}")
-                         raise IOError("Upload succeeded but response format is unexpected (missing mediaId).")
-                elif isinstance(response_json, dict) and response_json.get("result", {}).get("responseType") == "limiter":
-                     logger.warning("Limiter response received unexpectedly after successful upload retry loop.")
-                     raise AllCredentialsLimitedError("Rate limit encountered unexpectedly after upload.")
+                         response_json[0]["url"] = f"https://api.x.com/2/grok/attachment.json?mediaId={media_id}"
+                     logger.info(f"File {filename} uploaded successfully using credential #{self.current_cred_index + 1}")
+                     return response_json
                 else:
                      logger.warning(f"Unexpected upload response format: {response_json}")
-                     raise IOError(f"Upload failed or returned unexpected format: {response_json}")
-
+                     return []
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 logger.error(f"Error parsing upload response for {filename}: {e}")
                 raise IOError(f"Failed to parse upload response after retry: {e}") from e
 
-        except AllCredentialsLimitedError:
-            logger.error(f"File upload failed for {filename}: All credentials hit rate limit.")
-            raise
         except Exception as e:
             logger.error(f"Error during file upload preparation or execution for {filename}: {e}")
             raise IOError(f"Error during file upload: {e}") from e
         finally:
             if original_content_type:
-                self.current_headers["content-type"] = original_content_type
                 self.session.headers["content-type"] = original_content_type
-            else:
-                default_content_type = "application/json"
-                self.current_headers["content-type"] = default_content_type
-                self.session.headers["content-type"] = default_content_type
+                self.current_headers["content-type"] = original_content_type
 
 
     def create_message_payload(
@@ -518,7 +482,7 @@ class Grok:
     async def send_stream(self, request_payload: dict) -> AsyncGenerator[str, None]:
         """
         Send the conversation payload and stream the response line by line asynchronously using aiohttp.
-        Handles credential rotation on limiter errors detected *at the start* of the stream or during it.
+        Handles credential rotation on limiter errors detected *at the start* of the stream.
         Yields raw JSON lines (as strings with newline) from the response.
         """
         initial_cred_index = self.current_cred_index
@@ -529,125 +493,107 @@ class Grok:
             current_index_for_attempt = self.current_cred_index
             logger.info(f"Attempting stream request {attempt_count + 1}/{self.num_credentials} using credential #{current_index_for_attempt + 1}")
 
-            self._update_headers()
-            current_attempt_headers = self.current_headers.copy()
-
-            session: Optional[aiohttp.ClientSession] = None
             try:
-                session = aiohttp.ClientSession(headers=current_attempt_headers, timeout=timeout)
-                async with session.post(ADD_RESPONSE_URL, json=request_payload) as response:
-                    if not response.ok:
-                        error_text = await response.text()
-                        logger.warning(f"Stream request failed with HTTP {response.status} for credential #{current_index_for_attempt + 1}. Body: {error_text[:500]}")
-                        is_limiter_http = False
-                        if response.status == 429:
-                            is_limiter_http = True
-                        else:
-                            try:
-                                error_json = json.loads(error_text)
-                                if error_json.get("result", {}).get("responseType") == "limiter":
-                                    is_limiter_http = True
-                            except json.JSONDecodeError:
-                                pass
-
-                        if is_limiter_http:
-                            await session.close()
-                            wrapped = self._get_next_credentials()
-                            attempt_count += 1
-                            if wrapped and attempt_count >= self.num_credentials:
-                                raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP error during stream attempt).")
-                            continue
-                        else:
-                            response.raise_for_status()
-
-                    buffer = ""
-                    first_line_checked = False
-                    async for chunk in response.content.iter_any():
-                        if not chunk:
-                            continue
-                        try:
-                            buffer += chunk.decode('utf-8', errors='ignore')
-                        except UnicodeDecodeError as ude:
-                            logger.warning(f"Unicode decode error in chunk: {ude}. Skipping problematic part.")
-                            continue
-
-                        while '\n' in buffer:
-                            line, buffer = buffer.split('\n', 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-
-                            if not first_line_checked:
-                                first_line_checked = True
+                async with aiohttp.ClientSession(headers=self.current_headers, timeout=timeout) as session:
+                     async with session.post(ADD_RESPONSE_URL, json=request_payload) as response:
+                        if not response.ok:
+                            error_text = await response.text()
+                            logger.warning(f"Stream request failed with HTTP {response.status} for credential #{current_index_for_attempt + 1}. Body: {error_text[:500]}")
+                            is_limiter_http = False
+                            if response.status == 429:
+                                is_limiter_http = True
+                            else:
                                 try:
-                                    parsed_first = json.loads(line)
-                                    if parsed_first.get("result", {}).get("responseType") == "limiter":
-                                        logger.warning(f"Limiter detected in first stream chunk for credential #{current_index_for_attempt + 1}. Switching.")
-                                        raise StopAsyncIteration("limiter")
+                                    error_json = json.loads(error_text)
+                                    if error_json.get("result", {}).get("responseType") == "limiter":
+                                        is_limiter_http = True
                                 except json.JSONDecodeError:
                                     pass
-                                except Exception as e:
-                                    logger.error(f"Error checking first stream line for limiter: {e}")
 
-                            yield line + "\n"
+                            if is_limiter_http:
+                                wrapped = self._get_next_credentials()
+                                attempt_count += 1
+                                if wrapped and attempt_count >= self.num_credentials:
+                                    raise AllCredentialsLimitedError("All credentials hit the rate limiter (HTTP error during stream attempt).")
+                                await asyncio.sleep(1)
+                                continue
+                            else:
+                                response.raise_for_status()
 
-                    if buffer.strip():
-                         final_line = buffer.strip()
-                         if not first_line_checked:
-                             try:
-                                 parsed_final = json.loads(final_line)
-                                 if parsed_final.get("result", {}).get("responseType") == "limiter":
-                                     logger.warning(f"Limiter detected in final stream buffer for credential #{current_index_for_attempt + 1}. Switching.")
-                                     raise StopAsyncIteration("limiter")
-                             except json.JSONDecodeError: pass
-                             except Exception as e: logger.error(f"Error checking final buffer for limiter: {e}")
 
-                         yield final_line + "\n"
+                        buffer = ""
+                        first_line_checked = False
+                        async for chunk in response.content.iter_any():
+                            if not chunk:
+                                continue
+                            try:
+                                buffer += chunk.decode('utf-8', errors='ignore')
+                            except UnicodeDecodeError as ude:
+                                logger.warning(f"Unicode decode error in chunk: {ude}. Skipping problematic part.")
+                                continue
 
-                    logger.info(f"Stream completed successfully using credential #{self.current_cred_index + 1}")
-                    await session.close()
-                    return
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.strip()
+                                if not line:
+                                    continue
+
+                                if not first_line_checked:
+                                    first_line_checked = True
+                                    try:
+                                        parsed_first = json.loads(line)
+                                        if parsed_first.get("result", {}).get("responseType") == "limiter":
+                                            logger.warning(f"Limiter detected in first stream chunk for credential #{current_index_for_attempt + 1}. Switching.")
+                                            raise StopAsyncIteration("limiter")
+                                    except json.JSONDecodeError:
+                                        pass
+                                    except Exception as e:
+                                        logger.error(f"Error checking first stream line for limiter: {e}")
+
+                                yield line + "\n"
+
+                        if buffer.strip():
+                             if not first_line_checked:
+                                 try:
+                                     parsed_final = json.loads(buffer.strip())
+                                     if parsed_final.get("result", {}).get("responseType") == "limiter":
+                                         logger.warning(f"Limiter detected in final stream buffer for credential #{current_index_for_attempt + 1}. Switching.")
+                                         raise StopAsyncIteration("limiter")
+                                 except json.JSONDecodeError: pass
+                                 except Exception as e: logger.error(f"Error checking final buffer for limiter: {e}")
+
+                             yield buffer.strip() + "\n"
+
+                        logger.info(f"Stream completed successfully using credential #{self.current_cred_index + 1}")
+                        return
 
             except StopAsyncIteration as sai:
                 if str(sai) == "limiter":
-                    if session and not session.closed: await session.close()
                     wrapped = self._get_next_credentials()
                     attempt_count += 1
                     if wrapped and attempt_count >= self.num_credentials:
                         raise AllCredentialsLimitedError("All credentials hit the rate limiter during streaming.")
+                    await asyncio.sleep(1)
                     continue
                 else:
-                    if session and not session.closed: await session.close()
                     raise
 
             except aiohttp.ClientResponseError as e:
                 logger.error(f"Stream request failed (aiohttp {e.status}) for credential #{current_index_for_attempt + 1}: {e.message}")
-                if session and not session.closed: await session.close()
-                wrapped = self._get_next_credentials()
-                attempt_count += 1
-                if wrapped and attempt_count >= self.num_credentials:
-                     raise AllCredentialsLimitedError(f"Failed after trying all credentials due to HTTP errors. Last error: {e}") from e
-                continue
+                raise ConnectionError(f"Stream failed (HTTP {e.status}): {e.message}") from e
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.error(f"Stream connection error or timeout for credential #{current_index_for_attempt + 1}: {e}")
-                if session and not session.closed: await session.close()
-                wrapped = self._get_next_credentials()
-                attempt_count += 1
-                if wrapped and attempt_count >= self.num_credentials:
-                     raise AllCredentialsLimitedError(f"Failed after trying all credentials due to connection errors/timeouts. Last error: {e}") from e
-                continue
+            except aiohttp.ClientError as e:
+                logger.error(f"Stream connection error for credential #{current_index_for_attempt + 1}: {e}")
+                raise ConnectionError(f"Stream connection failed: {e}") from e
+
+            except asyncio.TimeoutError:
+                 logger.error(f"Stream request timed out for credential #{current_index_for_attempt + 1} after {timeout.total} seconds.")
+                 raise ConnectionError("Request timed out while streaming Grok response.") from asyncio.TimeoutError
 
             except Exception as e:
                 logger.error(f"Unexpected error during streaming with credential #{current_index_for_attempt + 1}: {e.__class__.__name__}: {e}")
-                if session and not session.closed: await session.close()
                 import traceback
                 traceback.print_exc()
                 raise ConnectionError(f"Unexpected streaming error: {e}") from e
-
-            finally:
-                 if session and not session.closed:
-                     await session.close()
-
 
         raise AllCredentialsLimitedError("Failed to get a successful stream after trying all credentials.")
